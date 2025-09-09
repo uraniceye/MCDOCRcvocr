@@ -5,9 +5,10 @@
 # -*- coding: utf-8 -*-
 """
 CVOCR(Context Vision OCR)文本识别插件 - 增强稳定版 v3.0 (2025)
+作者：跳舞的火公子
 完全重构，支持CVOCR最新版本，大幅增强文本检测精度和识别准确度
 新增智能文本检测、高级图像预处理、自适应参数优化等功能
-技术架构：FSRCNN + LayoutLMv2 + Tesseract + GPT-Neo + Transformer OCR
+技术架构：PP-OCRv3 + LayoutLMv2 + Tesseract + GPT-Neo + Transformer OCR
 """
 
 import os
@@ -39,7 +40,14 @@ import tempfile
 import shutil
 import platform
 import subprocess
-import psutil # <--- 修正2: 新增导入 psutil，用于系统内存检查
+import psutil 
+import functools 
+
+try:
+    import requests # ### 增强功能 1: 导入requests库用于自动下载模型
+except ImportError:
+    requests = None
+
 
 # 版本信息
 __version__ = "3.0.0"
@@ -164,12 +172,116 @@ class CVOCRConstants:
     DEFAULT_DPI = 300
     CACHE_EXPIRE_HOURS = 24
 
-class OCRPrecisionLevel(Enum):
-    """OCR精度等级枚举"""
-    FAST = "fast"          # 快速模式
-    BALANCED = "balanced"  # 平衡模式
-    ACCURATE = "accurate"  # 精确模式
-    ULTRA = "ultra"        # 超精确模式
+
+
+
+class ModelDownloader:
+    """
+    一个通用的模型下载和验证辅助类。
+    - 自动检查文件是否存在。
+    - 通过SHA256哈希值验证文件完整性。
+    - 如果文件不存在或损坏，则自动下载。
+    - 提供下载进度反馈。
+    """
+    def __init__(self, models_info: Dict, logger_func: Callable):
+        """
+        初始化下载器。
+        Args:
+            models_info (Dict): 包含模型信息的字典。
+            logger_func (Callable): 用于向GUI发送日志消息的函数。
+        """
+        self.models = models_info
+        self.log = logger_func
+
+    def _calculate_sha256(self, filepath: str) -> str:
+        """计算文件的SHA256哈希值"""
+        sha256_hash = hashlib.sha256()
+        try:
+            with open(filepath, "rb") as f:
+                # 逐块读取以处理大文件
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+            return sha256_hash.hexdigest()
+        except Exception as e:
+            self.log(f"❌ 计算哈希值失败: {filepath}, 错误: {e}", "ERROR")
+            return ""
+
+    def _verify_file(self, filepath: str, expected_hash: str) -> bool:
+        """验证文件的SHA256哈希值是否匹配"""
+        self.log(f"🔎 正在验证文件: {os.path.basename(filepath)}...", "INFO")
+        actual_hash = self._calculate_sha256(filepath)
+        if actual_hash.lower() == expected_hash.lower():
+            self.log(f"✅ 文件 '{os.path.basename(filepath)}' 验证成功。", "SUCCESS")
+            return True
+        else:
+            self.log(f"⚠️ 文件 '{os.path.basename(filepath)}' 验证失败！哈希值不匹配。", "WARNING")
+            self.log(f"   - 期望哈希: {expected_hash.lower()}", "DEBUG")
+            self.log(f"   - 实际哈希: {actual_hash.lower()}", "DEBUG")
+            return False
+
+    def _download_file(self, url: str, filepath: str) -> bool:
+        """从URL下载文件并显示进度"""
+        filename = os.path.basename(filepath)
+        self.log(f"🌐 开始下载: {filename}...", "INFO")
+        try:
+            with requests.get(url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                total_size = int(r.headers.get('content-length', 0))
+                bytes_downloaded = 0
+                last_logged_percent = -1
+                
+                with open(filepath, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        bytes_downloaded += len(chunk)
+                        if total_size > 0:
+                            percent = int((bytes_downloaded / total_size) * 100)
+                            if percent > last_logged_percent and percent % 10 == 0:
+                                self.log(f"   下载进度: {filename} - {percent}%", "INFO")
+                                last_logged_percent = percent
+            
+            self.log(f"✅ {filename} 下载完成。", "SUCCESS")
+            return True
+        except requests.exceptions.RequestException as e:
+            self.log(f"❌ 下载失败: {filename}, 错误: {e}", "ERROR")
+            if os.path.exists(filepath):
+                os.remove(filepath) # 删除不完整的文件
+            return False
+        except Exception as e:
+            self.log(f"❌ 保存文件时出错: {filename}, 错误: {e}", "ERROR")
+            return False
+
+    def check_and_download_all(self) -> bool:
+        """检查所有模型，如果需要则下载并验证。"""
+        for model_name, info in self.models.items():
+            filepath = info['filename']
+            
+            if os.path.exists(filepath):
+                if self._verify_file(filepath, info['sha256_hash']):
+                    continue  # 文件存在且完好，跳到下一个
+                else:
+                    self.log(f"检测到损坏文件 '{filepath}'。将删除并重新下载。", "WARNING")
+                    os.remove(filepath)
+            
+            # 如果文件不存在或已损坏被删除，则下载
+            if not self._download_file(info['url'], filepath):
+                messagebox.showerror("模型下载失败", 
+                                     f"无法下载关键模型文件 '{filepath}'。\n\n"
+                                     "图形和表格检测功能将不可用。\n"
+                                     "请检查您的网络连接和日志获取详细信息。")
+                return False  # 一旦有文件下载失败，则终止
+            
+            # 下载后再次验证
+            if not self._verify_file(filepath, info['sha256_hash']):
+                messagebox.showerror("模型验证失败", 
+                                     f"下载的模型文件 '{filepath}' 已损坏。\n\n"
+                                     "图形和表格检测功能将不可用。\n"
+                                     "请尝试重启程序或手动下载。")
+                return False # 验证失败，终止
+
+        self.log("✅ 所有YOLO模型文件均已准备就绪。", "SUCCESS")
+        return True
+
 class AdvancedTextSegmentator:
     """高级文本分割器 - 实现精确的文本行检测、字符分割和区域优化"""
     
@@ -220,13 +332,198 @@ class AdvancedTextSegmentator:
         
         logger.info("高级文本分割器已初始化")
 class EnhancedTextDetector(AdvancedTextSegmentator):
-    """增强版文本检测器 - 继承高级分割功能"""
-    
-    def detect_text_regions_advanced(self, image: np.ndarray, precision_level: OCRPrecisionLevel = OCRPrecisionLevel.BALANCED) -> Tuple[List[np.ndarray], Dict]:
-        """高级文本区域检测 - 多算法融合"""
+    """
+    增强版文本检测器 (V4.2 - 策略组合版)
+    - 允许用户通过算法列表动态组合检测策略。
+    - 废除固定的精度等级，改为灵活的方法调度。
+    """
+    def _is_likely_punctuation(self, region_info: Dict, reference_height: float) -> bool:
+        """
+        通过几何特征启发式地判断一个区域是否可能是标点符号。
+        Args:
+            region_info (Dict): 包含区域 'rect' 信息的字典。
+            reference_height (float): 用于比较的参考高度（通常是相邻文本块的高度）。
+        Returns:
+            bool: 如果区域可能是标点符号，则为 True。
+        """
+        if not region_info or reference_height <= 0:
+            return False
+        
         try:
-            # 检查缓存
-            cache_key = f"{hash(image.tobytes())}_{precision_level.value}"
+            _, (w, h), _ = region_info['rect']
+            # 标准化宽高
+            if w < h: w, h = h, w
+
+            # 标点符号的特征：
+            # 1. 高度明显小于正常字符。
+            # 2. 宽高比在一定范围内（覆盖了方形的点、逗号，以及扁平的破折号）。
+            is_small_enough = h < reference_height * 0.6
+            aspect_ratio = w / (h + 1e-6)
+            is_aspect_ratio_ok = 0.2 < aspect_ratio < 2.5
+            
+            return is_small_enough and is_aspect_ratio_ok
+        except Exception:
+            return False
+
+
+    def _aggregate_line_fragments(self, regions: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        (V5核心) 使用凸包聚合策略，将一行内的所有碎片强制合并成一个单一的、完整的区域。
+        这是一个整体性、非贪婪的合并方法。
+        
+        Args:
+            regions (List[np.ndarray]): 已被聚类到同一行的所有文本区域碎片。
+
+        Returns:
+            List[np.ndarray]: 一个只包含单个、已合并的文本行区域的列表。
+        """
+        if not regions:
+            return []
+        
+        # 如果一行只有一个碎片，直接返回，无需处理
+        if len(regions) == 1:
+            return regions
+            
+        try:
+            # 将该行所有碎片的所有顶点坐标收集到一个大的列表中
+            all_points = np.vstack(regions)
+            
+            # 计算能包围所有这些点的最小面积的旋转矩形
+            merged_rect = cv2.minAreaRect(all_points)
+            
+            # 获取这个最终矩形的四个角点
+            merged_box = cv2.boxPoints(merged_rect)
+            
+            # 返回只包含这一个完整行框的列表
+            return [merged_box.astype(np.float32)]
+
+        except Exception as e:
+            logger.error(f"行碎片聚合失败: {e}", exc_info=True)
+            # 发生错误时，安全地返回原始未合并的碎片
+            return regions       
+    def _merge_text_regions_in_line(self, regions: List[np.ndarray]) -> List[np.ndarray]:
+        """
+        智能合并在同一行内的文本区域 (V3 - 几何优化最终版)
+        此版本专注于通过更精确和更宽松的几何判断来提升合并效果。
+        - 回归到纯几何判断，移除了可能在新工作流下失效的像素特征分析。
+        - 采用更鲁棒的水平间隙计算方法，直接比较旋转矩形的边界。
+        - 适度放宽了垂直对齐和水平间隙的阈值，以合并更多合理的文本块。
+        """
+        if len(regions) <= 1:
+            return regions
+
+        try:
+            # 步骤1: 获取每个区域的详细几何信息，包括旋转矩形和其四个角点
+            regions_info = []
+            for r in regions:
+                # 使用 try-except 以处理无效区域，防止程序崩溃
+                try:
+                    rect = cv2.minAreaRect(r.astype(np.int32))
+                    # cv2.boxPoints 返回旋转矩形的4个角点，这对于精确计算间隙至关重要
+                    points = cv2.boxPoints(rect)
+                    regions_info.append({'region': r, 'rect': rect, 'points': points})
+                except cv2.error:
+                    logger.warning(f"跳过无效区域，无法计算 minAreaRect。")
+                    continue # 跳过这个无效区域
+
+            # 如果没有有效的区域可供处理，直接返回
+            if not regions_info:
+                return regions
+
+            # 步骤2: 按中心点的X坐标对区域进行排序，确保从左到右处理
+            regions_info.sort(key=lambda item: item['rect'][0][0])
+
+            # 步骤3: 迭代地进行分组和合并
+            merged_regions = []
+            if not regions_info:
+                return [] # 再次检查，以防万一
+            
+            # 初始化第一个合并组
+            current_merge_group = [regions_info[0]]
+
+            for i in range(1, len(regions_info)):
+                prev_info = current_merge_group[-1]
+                current_info = regions_info[i]
+
+                (cx_prev, cy_prev), (w_prev, h_prev), _ = prev_info['rect']
+                (cx_curr, cy_curr), (w_curr, h_curr), _ = current_info['rect']
+                
+                # 标准化宽高，确保 h 是较短的边（近似于文本行的高度）
+                if w_prev < h_prev: w_prev, h_prev = h_prev, w_prev
+                if w_curr < h_curr: w_curr, h_curr = h_curr, w_curr
+
+                # --- 步骤4: 定义并应用优化后的多维度合并条件 ---
+                
+                # 条件1: 垂直中心点对齐 (阈值已放宽)
+                # 使用两个区域中较高者的高度作为基准
+                max_height = max(h_prev, h_curr, 1) # 添加1以避免除以零
+                vertical_dist = abs(cy_prev - cy_curr)
+                # 只要垂直偏差小于最大高度的70%，就认为是对齐的
+                is_vertically_aligned = vertical_dist < max_height * 0.7
+
+                # 条件2: 水平间隙合理 (采用新算法，更精确，阈值已放宽)
+                # 获取前一个区域的最右侧x坐标和当前区域的最左侧x坐标
+                prev_max_x = np.max(prev_info['points'][:, 0])
+                curr_min_x = np.min(current_info['points'][:, 0])
+                # 计算它们之间的真实水平间隙
+                horizontal_gap = curr_min_x - prev_max_x
+                # 间隙应该为正（即不重叠），且小于一个较大的阈值（例如最大高度的3倍，允许几个字符的空格）
+                is_horizontally_close = 0 <= horizontal_gap < max_height * 3.0
+
+                # 条件3: 高度相似性 (这是一个很好的约束，保持不变)
+                height_ratio = min(h_prev, h_curr) / (max_height + 1e-6) # 加epsilon防止除零
+                is_height_similar = height_ratio > 0.6
+
+                # 综合判断：三个条件必须同时满足
+                if is_vertically_aligned and is_horizontally_close and is_height_similar:
+                    # 如果满足，将当前区域加入正在构建的合并组
+                    current_merge_group.append(current_info)
+                else:
+                    # 如果不满足，说明一个合并组结束了
+                    # 处理上一个合并组
+                    group_regions = [info['region'] for info in current_merge_group]
+                    if len(group_regions) > 1:
+                        # 如果组里有多个区域，将它们的所有点合并，并计算一个新的、能包围所有点的最小外接矩形
+                        all_points = np.vstack(group_regions)
+                        merged_rect = cv2.minAreaRect(all_points)
+                        merged_box = cv2.boxPoints(merged_rect)
+                        merged_regions.append(merged_box.astype(np.float32))
+                    else:
+                        # 如果组里只有一个区域，直接将其添加到结果中
+                        merged_regions.append(group_regions[0])
+                    
+                    # 开启一个新的合并组，并将当前区域作为新组的第一个成员
+                    current_merge_group = [current_info]
+
+            # 步骤5: 循环结束后，不要忘记处理最后一组
+            group_regions = [info['region'] for info in current_merge_group]
+            if len(group_regions) > 1:
+                all_points = np.vstack(group_regions)
+                merged_rect = cv2.minAreaRect(all_points)
+                merged_box = cv2.boxPoints(merged_rect)
+                merged_regions.append(merged_box.astype(np.float32))
+            else:
+                merged_regions.append(group_regions[0])
+                
+            return merged_regions
+
+        except Exception as e:
+            # 捕获整个方法的意外错误，并记录日志
+            logger.error(f"智能行合并时发生意外错误: {e}", exc_info=True)
+            # 在发生错误时，安全地返回原始未合并的区域列表，避免程序崩溃
+            return regions
+    def detect_text_regions_advanced(self, image: np.ndarray, 
+                                 enabled_algorithms: List[str]) -> Tuple[List[np.ndarray], Dict]:
+        """
+        高级文本区域检测 (V5 - 整体聚合版)
+        - 引入两阶段“聚类-聚合”工作流。
+        - 彻底放弃“成对合并”，改用基于凸包的“整体聚合”策略，从根本上解决碎片化问题。
+        """
+        try:
+            algorithms_key = "_".join(sorted(enabled_algorithms))
+            merge_status_key = f"merge_on" if self.config.get('enable_smart_line_merge', True) else "merge_off"
+            cache_key = f"{hash(image.tobytes())}_{algorithms_key}_{merge_status_key}"
+
             if cache_key in self._segmentation_cache:
                 cached_result = self._segmentation_cache[cache_key]
                 logger.info("使用缓存的分割结果")
@@ -234,264 +531,227 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             
             start_time = time.time()
             
-            # 预处理图像
-            if len(image.shape) == 3:
-                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image.copy()
+
+            # 步骤 1: 收集所有原始、精细的候选区域
+            all_raw_regions = []
+            methods_used = []
+            
+            algorithm_map = {
+                'simple_high_contrast': self._simple_high_contrast_detection,
+                'improved_mser': self._improved_mser_detection,
+                'multiscale_contour': self._multiscale_contour_detection,
+                'gradient_based': self._gradient_based_detection,
+                'multilevel_mser': lambda g: self._multilevel_mser_detection(g)[0],
+                'stroke_width_transform': lambda g: self._stroke_width_transform_detection(g)[0],
+                'connected_components': lambda g: self._connected_component_analysis(g)[0],
+                'character_level': lambda g: self._character_level_detection(g)[0]
+            }
+
+            for algo_name in enabled_algorithms:
+                if algo_name in algorithm_map:
+                    try:
+                        regions = algorithm_map[algo_name](gray)
+                        all_raw_regions.extend(regions)
+                        methods_used.append(algo_name)
+                    except Exception as e:
+                        logger.error(f"执行算法 '{algo_name}' 时失败: {e}")
+            
+            # 步骤 2: (可选) 对所有收集到的原始区域进行智能行聚合
+            regions_to_optimize = []
+            if self.config.get('enable_smart_line_merge', True):
+                logger.info(f"收集到 {len(all_raw_regions)} 个原始区域，开始执行智能行聚合...")
+                
+                if not all_raw_regions:
+                    regions_to_optimize = []
+                else:
+                    # 2a. 全局排序
+                    all_raw_regions.sort(key=lambda r: (cv2.boundingRect(r.astype(np.int32))[1], 
+                                                        cv2.boundingRect(r.astype(np.int32))[0]))
+                    
+                    # 2b. 动态行聚类
+                    lines = [[all_raw_regions[0]]]
+                    for i in range(1, len(all_raw_regions)):
+                        current_region = all_raw_regions[i]
+                        last_line = lines[-1]
+                        
+                        line_y_centers = [cv2.minAreaRect(r.astype(np.int32))[0][1] for r in last_line]
+                        line_heights = [min(cv2.minAreaRect(r.astype(np.int32))[1]) for r in last_line]
+                        
+                        avg_line_y = np.mean(line_y_centers)
+                        avg_line_h = np.mean(line_heights) if line_heights else 1
+
+                        curr_cy = cv2.minAreaRect(current_region.astype(np.int32))[0][1]
+                        
+                        if abs(curr_cy - avg_line_y) < avg_line_h * 0.7:
+                            last_line.append(current_region)
+                        else:
+                            lines.append([current_region])
+                
+                    # 2c. 【革命性改变】对每个聚类好的行，进行整体聚合
+                    merged_lines = []
+                    for line_regions in lines:
+                        # 调用全新的、更强大的聚合函数
+                        aggregated_line = self._aggregate_line_fragments(line_regions)
+                        merged_lines.extend(aggregated_line)
+                    
+                    regions_to_optimize = merged_lines
+                    logger.info(f"智能行聚合完成，区域数从 {len(all_raw_regions)} 聚合为 {len(regions_to_optimize)}。")
             else:
-                gray = image.copy()
+                logger.info("智能行聚合未启用，将直接优化原始区域。")
+                regions_to_optimize = all_raw_regions
+
+            # 步骤 3: 最终优化
+            final_regions = self._optimize_text_regions(regions_to_optimize, gray.shape)
+            final_regions = self._sort_regions_by_reading_order(final_regions)
             
-            # 根据精度级别选择检测策略
-            if precision_level == OCRPrecisionLevel.FAST:
-                text_regions, metadata = self._fast_text_detection(gray)
-            elif precision_level == OCRPrecisionLevel.BALANCED:
-                text_regions, metadata = self._balanced_text_detection(gray)
-            elif precision_level == OCRPrecisionLevel.ACCURATE:
-                text_regions, metadata = self._accurate_text_detection(gray)
-            else:  # ULTRA
-                text_regions, metadata = self._ultra_text_detection(gray)
-            
-            # 后处理优化
-            optimized_regions = self._optimize_text_regions(text_regions, gray.shape)
-            
-            # 文本行重组
-            line_regions = self._reorganize_text_lines(optimized_regions, gray)
-            
-            # 添加处理时间到元数据
+            # 步骤 4: 整理元数据并返回
             processing_time = time.time() - start_time
-            metadata.update({
+            
+            metadata = {
                 'processing_time': processing_time,
-                'precision_level': precision_level.value,
-                'total_regions': len(line_regions),
-                'optimization_applied': True
-            })
+                'detection_mode': 'custom_combination',
+                'algorithms_used': methods_used,
+                'total_regions': len(final_regions),
+                'raw_regions_count': len(all_raw_regions),
+            }
+            if self.config.get('enable_smart_line_merge', True):
+                metadata['merged_regions_count'] = len(regions_to_optimize)
             
-            # 缓存结果
-            self._manage_segmentation_cache(cache_key, {
-                'regions': line_regions,
-                'metadata': metadata
-            })
+            self._manage_segmentation_cache(cache_key, {'regions': final_regions, 'metadata': metadata})
+            logger.info(f"高级文本检测完成: {len(final_regions)}个区域, 耗时: {processing_time:.3f}秒, 使用算法: {methods_used}")
             
-            logger.info(f"高级文本检测完成: {len(line_regions)}个区域, 耗时: {processing_time:.3f}秒")
-            return line_regions, metadata
+            return final_regions, metadata
             
         except Exception as e:
-            logger.error(f"高级文本区域检测失败: {e}")
+            logger.error(f"高级文本区域检测失败: {e}", exc_info=True)
             return [], {'error': str(e)}
-    
-    def _fast_text_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """快速文本检测模式"""
+    def _simple_high_contrast_detection(self, gray: np.ndarray) -> List[np.ndarray]:
+        """
+        一个简单高效的检测方法，专门用于处理高对比度、低噪声的图像。(V2 - 增强版)
+        - 增加亮度均匀化预处理，以应对轻微的光照不均。
+        - 增加基于“实心度”的轮廓后过滤，以排除非文本的噪声。
+        """
         try:
             regions = []
             
-            # 快速自适应阈值
-            binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                         cv2.THRESH_BINARY_INV, 11, 2)
+            # --- 新增：亮度均匀化 ---
+            # 使用一个大核的模糊来估计背景光照
+            blurred = cv2.GaussianBlur(gray, (55, 55), 0)
+            # 从原图中除以背景，进行光照补偿
+            # 添加一个小的epsilon防止除以零
+            uniform_gray = (gray / (blurred + 1e-5)) * np.mean(blurred)
+            uniform_gray = cv2.normalize(uniform_gray, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+
+            # 使用Otsu方法进行全局二值化
+            _, binary = cv2.threshold(uniform_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             
-            # 简单形态学操作
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-            processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            # 查找外部轮廓
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
-            # 查找轮廓
-            contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            img_h, img_w = gray.shape
             
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > self.config['min_text_size'] ** 2:
-                    rect = cv2.minAreaRect(contour)
-                    box = cv2.boxPoints(rect)
-                    regions.append(box.astype(np.float32))
-            
-            metadata = {
-                'method': 'fast_adaptive_threshold',
-                'contours_found': len(contours),
-                'regions_filtered': len(regions)
-            }
-            
-            return regions, metadata
-            
-        except Exception as e:
-            logger.error(f"快速文本检测失败: {e}")
-            return [], {'error': str(e)}
-    
-    def _balanced_text_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """平衡文本检测模式"""
-        try:
-            regions = []
-            methods_used = []
-            
-            # 方法1: 改进的MSER检测
-            mser_regions = self._improved_mser_detection(gray)
-            regions.extend(mser_regions)
-            methods_used.append('improved_mser')
-            
-            # 方法2: 多尺度轮廓检测
-            contour_regions = self._multiscale_contour_detection(gray)
-            regions.extend(contour_regions)
-            methods_used.append('multiscale_contour')
-            
-            # 方法3: 梯度方向检测
-            gradient_regions = self._gradient_based_detection(gray)
-            regions.extend(gradient_regions)
-            methods_used.append('gradient_based')
-            
-            # 合并重叠区域
-            # 修正点：将调用不存在的 `_merge_overlapping_regions_advanced` 
-            # 替换为调用已存在的 `_resolve_overlapping_regions`。
-            merged_regions = self._resolve_overlapping_regions(regions) 
-            
-            metadata = {
-                'methods_used': methods_used,
-                'raw_regions': len(regions),
-                'merged_regions': len(merged_regions),
-                'detection_mode': 'balanced'
-            }
-            
-            return merged_regions, metadata
+                x, y, w, h = cv2.boundingRect(contour)
+
+                if (area > self.config['min_text_size']) and \
+                   (w < img_w * 0.95 and h < img_h * 0.95):
+                    
+                    aspect_ratio = w / h if h > 0 else 0
+                    if 0.01 < aspect_ratio < 100:
+                        
+                        # --- 新增：基于实心度的过滤 ---
+                        hull = cv2.convexHull(contour)
+                        hull_area = cv2.contourArea(hull)
+                        solidity = float(area) / (hull_area + 1e-6)
+                        
+                        # 文本轮廓通常比较“实心”，而噪点则形状不规则
+                        if solidity > 0.4:
+                            rect = cv2.minAreaRect(contour)
+                            box = cv2.boxPoints(rect)
+                            regions.append(box.astype(np.float32))
+
+            logger.info(f"简单高对比度检测完成，找到 {len(regions)} 个候选区域。")
+            return regions
             
         except Exception as e:
-            logger.error(f"平衡文本检测失败: {e}")
-            return [], {'error': str(e)}
-    
-    def _accurate_text_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """精确文本检测模式"""
-        try:
-            regions = []
-            detection_stats = {}
-            
-            # 方法1: 多尺度MSER检测
-            mser_regions, mser_stats = self._multiscale_mser_detection(gray)
-            regions.extend(mser_regions)
-            detection_stats['mser'] = mser_stats
-            
-            # 方法2: 高精度轮廓检测
-            contour_regions, contour_stats = self._high_precision_contour_detection(gray)
-            regions.extend(contour_regions)
-            detection_stats['contour'] = contour_stats
-            
-            # 方法3: 文本行连接检测
-            line_regions, line_stats = self._text_line_connection_detection(gray)
-            regions.extend(line_regions)
-            detection_stats['text_line'] = line_stats
-            
-            # 方法4: SWT (Stroke Width Transform) 检测
-            swt_regions, swt_stats = self._stroke_width_transform_detection(gray)
-            regions.extend(swt_regions)
-            detection_stats['swt'] = swt_stats
-            
-            # 高级合并和过滤
-            merged_regions = self._advanced_region_merging(regions, gray)
-            filtered_regions = self._intelligent_region_filtering(merged_regions, gray)
-            
-            metadata = {
-                'detection_stats': detection_stats,
-                'raw_regions': len(regions),
-                'merged_regions': len(merged_regions),
-                'final_regions': len(filtered_regions),
-                'detection_mode': 'accurate'
-            }
-            
-            return filtered_regions, metadata
-            
-        except Exception as e:
-            logger.error(f"精确文本检测失败: {e}")
-            return [], {'error': str(e)}
-    
-    def _ultra_text_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """超精确文本检测模式"""
-        try:
-            regions = []
-            ultra_stats = {}
-            
-            # 方法1: 多层次MSER检测
-            mser_regions, mser_stats = self._multilevel_mser_detection(gray)
-            regions.extend(mser_regions)
-            ultra_stats['multilevel_mser'] = mser_stats
-            
-            # 方法2: 自适应多阈值检测
-            threshold_regions, threshold_stats = self._adaptive_multithreshold_detection(gray)
-            regions.extend(threshold_regions)
-            ultra_stats['adaptive_threshold'] = threshold_stats
-            
-            # 方法3: 连通分量分析
-            cc_regions, cc_stats = self._connected_component_analysis(gray)
-            regions.extend(cc_regions)
-            ultra_stats['connected_components'] = cc_stats
-            
-            # 方法4: 文本方向自适应检测
-            orientation_regions, orientation_stats = self._orientation_adaptive_detection(gray)
-            regions.extend(orientation_regions)
-            ultra_stats['orientation_adaptive'] = orientation_stats
-            
-            # 方法5: 字符级分割检测
-            char_regions, char_stats = self._character_level_detection(gray)
-            regions.extend(char_regions)
-            ultra_stats['character_level'] = char_stats
-            
-            # 超精确合并和优化
-            merged_regions = self._ultra_precise_merging(regions, gray)
-            optimized_regions = self._final_optimization(merged_regions, gray)
-            
-            metadata = {
-                'ultra_stats': ultra_stats,
-                'raw_regions': len(regions),
-                'merged_regions': len(merged_regions),
-                'optimized_regions': len(optimized_regions),
-                'detection_mode': 'ultra'
-            }
-            
-            return optimized_regions, metadata
-            
-        except Exception as e:
-            logger.error(f"超精确文本检测失败: {e}")
-            return [], {'error': str(e)}
-    
+            logger.error(f"简单高对比度检测失败: {e}")
+            return []
     def _improved_mser_detection(self, gray: np.ndarray) -> List[np.ndarray]:
-        """改进的MSER检测"""
+        """
+        改进的MSER检测 (V3 - API兼容最终版)
+        - 采用创建实例后逐一设置参数的方式，彻底解决各OpenCV版本间的关键字参数兼容性问题。
+        - 保留了动态Delta、双向检测和NMS等所有增强功能。
+        """
         try:
-            regions = []
+            all_regions_with_scores = []
             
-            # 多参数MSER检测
-            # 修正点：将参数名中的下划线移除
-            mser_configs = [
-                {'min_area': 30, 'max_area': 14400, 'max_variation': 0.25, 'min_diversity': 0.2},
-                {'min_area': 60, 'max_area': 10000, 'max_variation': 0.3, 'min_diversity': 0.15},
-                {'min_area': 100, 'max_area': 8000, 'max_variation': 0.2, 'min_diversity': 0.25}
-            ]
-            
-            for config in mser_configs:
+            contrast_std = np.std(gray)
+            delta = int(max(2, min(10, 5.0 * (contrast_std / 128.0))))
+            logger.debug(f"MSER动态Delta设置为: {delta} (基于图像标准差: {contrast_std:.2f})")
+
+            for image_pass in [gray, cv2.bitwise_not(gray)]:
                 try:
-                    # 调用 cv2.MSER_create 时使用修正后的参数名
-                    mser = cv2.MSER_create(**config)
-                    mser_regions, _ = mser.detectRegions(gray)
+                    # --- 核心修正：采用 Setter 方法配置 MSER ---
+                    # 1. 创建一个默认的 MSER 对象
+                    mser = cv2.MSER_create()
+                    
+                    # 2. 逐一调用 setter 方法来设置参数
+                    mser.setDelta(delta)
+                    mser.setMinArea(30)
+                    mser.setMaxArea(14400)
+                    mser.setMaxVariation(0.25)
+                    mser.setMinDiversity(0.2)
+                    # --- 修正结束 ---
+                    
+                    mser_regions, _ = mser.detectRegions(image_pass)
                     
                     for region in mser_regions:
                         hull = cv2.convexHull(region.reshape(-1, 1, 2))
                         rect = cv2.minAreaRect(hull)
                         box = cv2.boxPoints(rect)
                         
-                        # 验证区域质量
                         if self._validate_text_region(box, gray):
-                            regions.append(box.astype(np.float32))
-                            
+                            score = cv2.contourArea(box)
+                            all_regions_with_scores.append((box, score))
+
                 except Exception as e:
-                    # 记录具体的错误信息，有助于调试
-                    logger.warning(f"MSER配置失败: {e}")
-                    continue
+                    logger.warning(f"MSER创建或检测失败: {e}")
+
+            if not all_regions_with_scores:
+                return []
+
+            boxes = [item[0] for item in all_regions_with_scores]
+            scores = [item[1] for item in all_regions_with_scores]
+            rects_for_nms = [cv2.boundingRect(box.astype(np.int32)) for box in boxes]
             
-            return regions
+            indices = cv2.dnn.NMSBoxes(rects_for_nms, scores, score_threshold=0.1, nms_threshold=0.3)
+            
+            final_regions = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    final_regions.append(boxes[i].astype(np.float32))
+            
+            return final_regions
             
         except Exception as e:
             logger.error(f"改进MSER检测失败: {e}")
             return []
     
+    
     def _multiscale_contour_detection(self, gray: np.ndarray) -> List[np.ndarray]:
-        """多尺度轮廓检测"""
+        """
+        多尺度轮廓检测 (V2 - 增强版)
+        - 使用多方向形态学核（水平、垂直、方形），以适应不同方向的文本。
+        - 形态学核的大小与当前处理的图像尺度动态关联。
+        - 增加轮廓层级分析，以过滤掉内部孔洞等非文本轮廓。
+        """
         try:
             regions = []
             scales = [0.8, 1.0, 1.2, 1.5]
             
             for scale in scales:
-                # 缩放图像
                 if scale != 1.0:
                     h, w = gray.shape
                     new_h, new_w = int(h * scale), int(w * scale)
@@ -499,7 +759,6 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
                 else:
                     scaled_gray = gray
                 
-                # 多种阈值方法
                 for threshold_size in self.config['adaptive_threshold_sizes']:
                     try:
                         binary = cv2.adaptiveThreshold(
@@ -507,26 +766,43 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
                             cv2.THRESH_BINARY_INV, threshold_size, 2
                         )
                         
-                        # 形态学操作
-                        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
-                        processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, 
-                                                   iterations=self.config['morphology_iterations'])
+                        # --- 新增：多方向和自适应大小的形态学核 ---
+                        # 核的大小根据当前图像缩放比例调整
+                        base_kernel_w = max(3, int(5 * scale))
+                        base_kernel_h = max(3, int(5 * scale))
                         
-                        # 查找轮廓
-                        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        kernels = [
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (base_kernel_w, 1)), # 水平
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, base_kernel_h)), # 垂直
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))              # 方形
+                        ]
                         
-                        for contour in contours:
-                            area = cv2.contourArea(contour)
-                            if area > self.config['connected_component_min_area']:
-                                rect = cv2.minAreaRect(contour)
-                                box = cv2.boxPoints(rect)
-                                
-                                # 缩放回原始尺寸
-                                if scale != 1.0:
-                                    box = box / scale
-                                
-                                regions.append(box.astype(np.float32))
-                                
+                        merged_morph = np.zeros_like(binary)
+                        for kernel in kernels:
+                            processed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, 
+                                                       iterations=self.config['morphology_iterations'])
+                            # 将不同方向处理的结果合并
+                            merged_morph = cv2.bitwise_or(merged_morph, processed)
+
+                        # --- 新增：使用轮廓层级分析 ---
+                        # RETR_CCOMP 查找所有轮廓并组织成两层：外部和内部（孔洞）
+                        contours, hierarchy = cv2.findContours(merged_morph, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        if hierarchy is None: continue
+
+                        # 只处理外部轮廓 (hierarchy[0][i][3] == -1 表示没有父轮廓)
+                        for i, contour in enumerate(contours):
+                            if hierarchy[0][i][3] == -1:
+                                area = cv2.contourArea(contour)
+                                if area > self.config['connected_component_min_area']:
+                                    rect = cv2.minAreaRect(contour)
+                                    box = cv2.boxPoints(rect)
+                                    
+                                    if scale != 1.0:
+                                        box = box / scale
+                                    
+                                    regions.append(box.astype(np.float32))
+                                    
                     except Exception as e:
                         logger.warning(f"阈值{threshold_size}处理失败: {e}")
                         continue
@@ -536,38 +812,35 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
         except Exception as e:
             logger.error(f"多尺度轮廓检测失败: {e}")
             return []
-    
     def _gradient_based_detection(self, gray: np.ndarray) -> List[np.ndarray]:
-        """基于梯度的文本检测"""
+        """
+        基于梯度的文本检测 (V2 - 增强版)
+        - 使用更精确的 Scharr 算子代替 Sobel。
+        - 引入梯度方向信息，过滤掉内部梯度方向混乱的非文本区域。
+        """
         try:
             regions = []
             
-            # 计算梯度
-            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            # --- 改进：使用 Scharr 算子 ---
+            grad_x = cv2.Scharr(gray, cv2.CV_64F, 1, 0)
+            grad_y = cv2.Scharr(gray, cv2.CV_64F, 0, 1)
             
-            # 梯度幅值和方向
             magnitude = np.sqrt(grad_x**2 + grad_y**2)
-            angle = np.arctan2(grad_y, grad_x)
+            # 梯度方向，单位为度
+            angle = np.arctan2(grad_y, grad_x) * (180 / np.pi)
             
-            # 归一化梯度幅值
-            magnitude = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            magnitude_norm = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             
-            # 阈值化
-            _, binary = cv2.threshold(magnitude, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            _, binary = cv2.threshold(magnitude_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             
-            # 形态学操作连接文本
             kernel_horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
             kernel_vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
             
-            # 处理水平和垂直文本
             horizontal = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_horizontal)
             vertical = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_vertical)
             
-            # 合并结果
             combined = cv2.bitwise_or(horizontal, vertical)
             
-            # 查找轮廓
             contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             
             for contour in contours:
@@ -576,9 +849,19 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
                     rect = cv2.minAreaRect(contour)
                     box = cv2.boxPoints(rect)
                     
-                    # 验证是否为文本区域
-                    if self._validate_gradient_region(box, magnitude):
-                        regions.append(box.astype(np.float32))
+                    # --- 新增：使用梯度方向进行验证 ---
+                    # 文本区域内部的梯度方向应该比较集中
+                    mask = np.zeros_like(gray, dtype=np.uint8)
+                    cv2.fillPoly(mask, [box.astype(np.int32)], 255)
+                    
+                    # 提取区域内的梯度方向
+                    region_angles = angle[mask > 0]
+                    if len(region_angles) > 10: # 至少需要10个点才有统计意义
+                        # 计算梯度方向的标准差，值越小说明方向越一致
+                        angle_std = np.std(region_angles)
+                        # 文本区域的梯度方向标准差通常较小
+                        if angle_std < 45: # 阈值可调
+                            regions.append(box.astype(np.float32))
             
             return regions
             
@@ -587,69 +870,97 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             return []
     
     def _stroke_width_transform_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """笔画宽度变换检测"""
+        """
+        笔画宽度变换检测 (V2 - 增强版)
+        - 实现双向追踪以获得更准确的笔画宽度。
+        - 对生成的SWT图像进行中值滤波后处理。
+        - 增加一个简单的字符组件合并步骤。
+        """
         try:
-            regions = []
-            stats = {'swt_regions': 0, 'valid_strokes': 0}
+            # 引入一个内部的 SWT 追踪函数
+            def trace_stroke(x, y, grad_x, grad_y, edges, max_len=50):
+                points = []
+                # 沿梯度方向追踪
+                for i in range(1, max_len):
+                    nx = int(x + grad_x * i)
+                    ny = int(y + grad_y * i)
+                    if not (0 <= nx < edges.shape[1] and 0 <= ny < edges.shape[0]):
+                        break
+                    points.append((nx, ny))
+                    if edges[ny, nx] > 0:
+                        # 检查梯度是否大致相反
+                        g_nx, g_ny = grad_x_norm[ny, nx], grad_y_norm[ny, nx]
+                        if np.dot([grad_x, grad_y], [g_nx, g_ny]) < -0.8:
+                            return points
+                return None
+
+            edges = cv2.Canny(gray, 50, 150)
+            grad_x = cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+            magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            grad_x_norm = grad_x / (magnitude + 1e-9)
+            grad_y_norm = grad_y / (magnitude + 1e-9)
+
+            swt = np.full(gray.shape, np.inf, dtype=np.float32)
+            rays = []
             
-            # 计算边缘和梯度
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            # 寻找边缘点并追踪
+            edge_coords = np.argwhere(edges > 0)
+            for y, x in edge_coords:
+                gx, gy = grad_x_norm[y, x], grad_y_norm[y, x]
+                ray = trace_stroke(x, y, gx, gy, edges)
+                if ray:
+                    stroke_width = np.linalg.norm(np.array(ray[-1]) - np.array((x,y)))
+                    for p in ray:
+                        swt[p[1], p[0]] = min(swt[p[1], p[0]], stroke_width)
+                    rays.append(ray)
+
+            # SWT 后处理
+            swt[swt == np.inf] = 0
+            swt_norm = cv2.normalize(swt, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            _, swt_binary = cv2.threshold(swt_norm, 1, 255, cv2.THRESH_BINARY)
             
-            # 计算梯度方向
-            gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-            gradient_direction = np.arctan2(grad_y, grad_x)
-            
-            # 创建SWT图像
-            swt = np.full(gray.shape, np.inf, dtype=np.float64)
-            
-            # 查找边缘点
-            edge_points = np.where(edges > 0)
-            
-            for i in range(len(edge_points[0])):
-                y, x = edge_points[0][i], edge_points[1][i]
-                
-                if gradient_magnitude[y, x] > 0:
-                    # 沿梯度方向追踪
-                    direction = gradient_direction[y, x]
-                    
-                    # 正方向追踪
-                    stroke_width = self._trace_stroke_width(
-                        edges, gradient_direction, x, y, direction, gray.shape
-                    )
-                    
-                    if stroke_width > 0 and stroke_width < 300:  # 合理的笔画宽度
-                        swt[y, x] = stroke_width
-                        stats['valid_strokes'] += 1
-            
-            # 从SWT图像中提取文本区域
-            swt_binary = np.zeros_like(gray)
-            swt_binary[swt < np.inf] = 255
-            
-            # 连通分量分析
-            num_labels, labels, stats_cc, centroids = cv2.connectedComponentsWithStats(swt_binary, connectivity=8)
-            
-            for i in range(1, num_labels):  # 跳过背景
+            # --- 新增：中值滤波平滑SWT图 ---
+            swt_binary = cv2.medianBlur(swt_binary, 3)
+
+            num_labels, labels, stats_cc, _ = cv2.connectedComponentsWithStats(swt_binary)
+
+            # --- 新增：简单的字符组件合并 ---
+            char_boxes = []
+            for i in range(1, num_labels):
                 if stats_cc[i, cv2.CC_STAT_AREA] > self.config['connected_component_min_area']:
-                    # 提取组件
-                    mask = (labels == i).astype(np.uint8) * 255
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    if contours:
-                        largest_contour = max(contours, key=cv2.contourArea)
-                        rect = cv2.minAreaRect(largest_contour)
-                        box = cv2.boxPoints(rect)
-                        
-                        # 验证笔画宽度一致性
-                        if self._validate_stroke_consistency(box, swt):
-                            regions.append(box.astype(np.float32))
-                            stats['swt_regions'] += 1
-            
-            return regions, stats
-            
+                    x, y, w, h = stats_cc[i, cv2.CC_STAT_LEFT], stats_cc[i, cv2.CC_STAT_TOP], \
+                                 stats_cc[i, cv2.CC_STAT_WIDTH], stats_cc[i, cv2.CC_STAT_HEIGHT]
+                    if 0.1 < w/h < 10 and h > 8:
+                        char_boxes.append([x, y, x+w, y+h])
+
+            # 水平合并字符框
+            def merge_boxes(boxes):
+                if not boxes: return []
+                boxes.sort(key=lambda b: b[0])
+                merged = [boxes[0]]
+                for box in boxes[1:]:
+                    last = merged[-1]
+                    # 如果垂直重叠且水平接近，则合并
+                    if (box[1] < last[3] and box[3] > last[1]) and \
+                       (box[0] - last[2] < (last[3] - last[1])): # 间距小于高度
+                        last[2] = max(last[2], box[2])
+                        last[3] = max(last[3], box[3])
+                        last[1] = min(last[1], box[1])
+                    else:
+                        merged.append(box)
+                return merged
+
+            merged_box_coords = merge_boxes(char_boxes)
+            final_regions = []
+            for box in merged_box_coords:
+                x1, y1, x2, y2 = box
+                final_regions.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32))
+
+            return final_regions, {'swt_rays': len(rays)}
+
         except Exception as e:
-            logger.error(f"SWT检测失败: {e}")
+            logger.error(f"SWT检测失败: {e}", exc_info=True)
             return [], {'error': str(e)}
     
     def _trace_stroke_width(self, edges: np.ndarray, gradient_direction: np.ndarray, 
@@ -718,54 +1029,87 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             return False
     
     def _connected_component_analysis(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """连通分量分析"""
+        """
+        连通分量分析 (V2 - 增强版)
+        - 增加断裂字符合并逻辑（如合并 'i' 的点和杠）。
+        - 增加粘连字符分割的初步尝试（基于形态学）。
+        """
         try:
             regions = []
-            stats = {'total_components': 0, 'valid_components': 0}
+            stats = {'total_components': 0, 'valid_components': 0, 'merged': 0, 'split': 0}
             
-            # 多种二值化方法
             binary_methods = [
                 lambda img: cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2),
-                lambda img: cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 3),
                 lambda img: cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
             ]
             
+            all_components = []
             for binary_method in binary_methods:
                 try:
                     binary = binary_method(gray)
                     
-                    # 连通分量分析
-                    num_labels, labels, stats_cc, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-                    stats['total_components'] += num_labels - 1  # 排除背景
+                    # --- 新增：尝试分割粘连字符 ---
+                    # 使用形态学开运算来断开细小的连接
+                    kernel = np.ones((3,1), np.uint8)
+                    binary_split = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
                     
-                    for i in range(1, num_labels):  # 跳过背景
-                        area = stats_cc[i, cv2.CC_STAT_AREA]
-                        width = stats_cc[i, cv2.CC_STAT_WIDTH]
-                        height = stats_cc[i, cv2.CC_STAT_HEIGHT]
-                        
-                        # 验证组件特征
+                    num_labels, _, stats_cc, centroids = cv2.connectedComponentsWithStats(binary_split, connectivity=8)
+                    stats['total_components'] += num_labels - 1
+                    
+                    for i in range(1, num_labels):
+                        area, w, h = stats_cc[i, cv2.CC_STAT_AREA], stats_cc[i, cv2.CC_STAT_WIDTH], stats_cc[i, cv2.CC_STAT_HEIGHT]
                         if (area > self.config['connected_component_min_area'] and 
-                            self.config['char_min_width'] <= width <= self.config['char_max_width'] and
-                            self.config['char_min_height'] <= height <= self.config['char_max_height']):
+                            self.config['char_min_width'] <= w <= self.config['char_max_width'] and
+                            self.config['char_min_height'] <= h <= self.config['char_max_height']):
                             
-                            # 提取组件轮廓
-                            mask = (labels == i).astype(np.uint8) * 255
-                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                            
-                            if contours:
-                                largest_contour = max(contours, key=cv2.contourArea)
-                                rect = cv2.minAreaRect(largest_contour)
-                                box = cv2.boxPoints(rect)
-                                
-                                # 进一步验证
-                                if self._validate_component_shape(box, mask):
-                                    regions.append(box.astype(np.float32))
-                                    stats['valid_components'] += 1
-                                    
+                            x, y = stats_cc[i, cv2.CC_STAT_LEFT], stats_cc[i, cv2.CC_STAT_TOP]
+                            all_components.append({'bbox': [x, y, x+w, y+h], 'centroid': centroids[i]})
+                            stats['valid_components'] += 1
+
                 except Exception as e:
                     logger.warning(f"连通分量方法失败: {e}")
                     continue
             
+            # --- 新增：断裂字符合并逻辑 ---
+            if not all_components: return [], stats
+            
+            merged_components = []
+            all_components.sort(key=lambda c: (c['bbox'][1], c['bbox'][0])) # 从上到下，从左到右排序
+            used = [False] * len(all_components)
+
+            for i in range(len(all_components)):
+                if used[i]: continue
+                
+                comp1 = all_components[i]
+                bbox1 = comp1['bbox']
+                merged_bbox = list(bbox1)
+                
+                for j in range(i + 1, len(all_components)):
+                    if used[j]: continue
+                    comp2 = all_components[j]
+                    bbox2 = comp2['bbox']
+
+                    # 检查是否垂直对齐且足够近 (合并 'i' 的点)
+                    is_vertically_aligned = abs(comp1['centroid'][0] - comp2['centroid'][0]) < (bbox1[2] - bbox1[0])
+                    vertical_gap = bbox2[1] - bbox1[3]
+                    is_close = 0 <= vertical_gap < (bbox1[3] - bbox1[1]) * 0.5
+
+                    if is_vertically_aligned and is_close:
+                        # 合并bbox
+                        merged_bbox[0] = min(merged_bbox[0], bbox2[0])
+                        merged_bbox[1] = min(merged_bbox[1], bbox2[1])
+                        merged_bbox[2] = max(merged_bbox[2], bbox2[2])
+                        merged_bbox[3] = max(merged_bbox[3], bbox2[3])
+                        used[j] = True
+                        stats['merged'] += 1
+                
+                merged_components.append(merged_bbox)
+
+            for bbox in merged_components:
+                x1, y1, x2, y2 = bbox
+                box = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                regions.append(box)
+
             return regions, stats
             
         except Exception as e:
@@ -806,40 +1150,77 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             return False
     
     def _character_level_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """字符级检测"""
+        """
+        字符级检测 (V2 - 增强版)
+        - 使用距离变换 + 分水岭算法代替鲁棒性差的垂直投影法。
+        - 能够在一定程度上处理倾斜和粘连的字符。
+        """
         try:
-            regions = []
             stats = {'char_candidates': 0, 'valid_chars': 0}
             
-            # 多尺度字符检测
-            scales = [0.8, 1.0, 1.2]
+            # 1. 预处理
+            binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                           cv2.THRESH_BINARY_INV, 15, 4)
             
-            for scale in scales:
-                # 缩放图像
-                if scale != 1.0:
-                    h, w = gray.shape
-                    new_h, new_w = int(h * scale), int(w * scale)
-                    scaled_gray = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-                else:
-                    scaled_gray = gray
+            # 移除小的噪声
+            kernel = np.ones((2,2), np.uint8)
+            opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+            
+            # 确定背景区域
+            sure_bg = cv2.dilate(opening, kernel, iterations=3)
+
+            # 2. 距离变换
+            dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+            # 归一化以方便设置阈值
+            cv2.normalize(dist_transform, dist_transform, 0, 1.0, cv2.NORM_MINMAX)
+            
+            # 确定前景区域（字符的核心）
+            # 距离变换图中值越大的点，越是字符的中心
+            _, sure_fg = cv2.threshold(dist_transform, 0.5 * dist_transform.max(), 255, 0)
+            sure_fg = np.uint8(sure_fg)
+
+            # 找到未知区域（可能是字符边界）
+            unknown = cv2.subtract(sure_bg, sure_fg)
+
+            # 3. 连通分量标记
+            # sure_fg 里的每个连通区域都是一个字符的核心
+            num_labels, markers = cv2.connectedComponents(sure_fg)
+            # 将背景标记为0
+            markers = markers + 1
+            # 将未知区域标记为0，这样分水岭算法就会在这里画出边界
+            markers[unknown == 255] = 0
+            
+            # 4. 分水岭算法
+            # 分水岭算法需要一个3通道图像
+            gray_3channel = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            markers = cv2.watershed(gray_3channel, markers)
+
+            # 5. 提取分割后的字符区域
+            final_regions = []
+            for label in np.unique(markers):
+                # -1是边界，1是背景
+                if label <= 1: continue
+
+                # 创建一个只包含当前字符的掩码
+                mask = np.zeros(gray.shape, dtype="uint8")
+                mask[markers == label] = 255
                 
-                # 字符分离
-                char_regions = self._separate_characters(scaled_gray)
-                stats['char_candidates'] += len(char_regions)
-                
-                # 缩放回原始尺寸并验证
-                for region in char_regions:
-                    if scale != 1.0:
-                        region = region / scale
+                # 查找该字符的轮廓
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    # 使用最小外接矩形作为边界框
+                    contour = max(contours, key=cv2.contourArea)
+                    rect = cv2.minAreaRect(contour)
+                    box = cv2.boxPoints(rect)
                     
-                    if self._validate_character_region(region, gray):
-                        regions.append(region.astype(np.float32))
+                    if self._validate_character_region(box, gray):
+                        final_regions.append(box.astype(np.float32))
                         stats['valid_chars'] += 1
-            
-            return regions, stats
+
+            return final_regions, stats
             
         except Exception as e:
-            logger.error(f"字符级检测失败: {e}")
+            logger.error(f"字符级检测失败: {e}", exc_info=True)
             return [], {'error': str(e)}
     
     def _separate_characters(self, gray: np.ndarray) -> List[np.ndarray]:
@@ -1335,50 +1716,67 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
     
     # 新增高级分割方法
     def _multilevel_mser_detection(self, gray: np.ndarray) -> Tuple[List[np.ndarray], Dict]:
-        """多层次MSER检测"""
+        """
+        多层次MSER检测 (V3 - API兼容最终版)
+        - 同样采用创建实例后逐一设置参数的方式，解决兼容性问题。
+        """
         try:
-            regions = []
-            stats = {'levels_processed': 0, 'regions_per_level': []}
-            
-            # 多层次参数配置
-            # 修正点：将参数名中的下划线移除
-            mser_levels = [
-                # 细粒度检测
-                {'min_area': 15, 'max_area': 2000, 'max_variation': 0.15, 'min_diversity': 0.3},
-                # 中等粒度检测
-                {'min_area': 50, 'max_area': 8000, 'max_variation': 0.25, 'min_diversity': 0.2},
-                # 粗粒度检测
-                {'min_area': 150, 'max_area': 15000, 'max_variation': 0.35, 'min_diversity': 0.15},
-                # 超大区域检测
-                {'min_area': 500, 'max_area': 25000, 'max_variation': 0.4, 'min_diversity': 0.1}
+            all_regions_with_scores_levels = []
+            stats = {'levels_processed': 0, 'raw_regions_per_level': []}
+
+            # 现在 config 字典中的键名是什么已不再重要，因为我们将通过 setter 调用
+            mser_levels_configs = [
+                {'delta': 3, 'min_area': 15, 'max_area': 2000, 'max_variation': 0.15, 'min_diversity': 0.3},
+                {'delta': 5, 'min_area': 50, 'max_area': 8000, 'max_variation': 0.25, 'min_diversity': 0.2},
+                {'delta': 7, 'min_area': 150, 'max_area': 15000, 'max_variation': 0.35, 'min_diversity': 0.15},
             ]
             
-            for level, config in enumerate(mser_levels):
-                try:
-                    # 调用 cv2.MSER_create 时使用修正后的参数名
-                    mser = cv2.MSER_create(**config)
-                    level_regions, _ = mser.detectRegions(gray)
-                    
-                    level_valid_regions = []
-                    for region in level_regions:
-                        # 计算凸包
-                        hull = cv2.convexHull(region.reshape(-1, 1, 2))
-                        rect = cv2.minAreaRect(hull)
-                        box = cv2.boxPoints(rect)
+            for level, config in enumerate(mser_levels_configs):
+                level_regions_scores = []
+                for image_pass in [gray, cv2.bitwise_not(gray)]:
+                    try:
+                        # --- 核心修正：采用 Setter 方法配置 MSER ---
+                        mser = cv2.MSER_create()
+                        mser.setDelta(config['delta'])
+                        mser.setMinArea(config['min_area'])
+                        mser.setMaxArea(config['max_area'])
+                        mser.setMaxVariation(config['max_variation'])
+                        mser.setMinDiversity(config['min_diversity'])
+                        # --- 修正结束 ---
+
+                        level_regions, _ = mser.detectRegions(image_pass)
                         
-                        # 多层次验证
-                        if self._validate_multilevel_region(box, gray, level):
-                            regions.append(box.astype(np.float32))
-                    
-                    stats['regions_per_level'].append(len(level_valid_regions))
-                    stats['levels_processed'] += 1
-                    
-                except Exception as e:
-                    # 记录具体的错误信息，有助于调试
-                    logger.warning(f"MSER级别{level}失败: {e}")
-                    stats['regions_per_level'].append(0)
+                        for region in level_regions:
+                            hull = cv2.convexHull(region.reshape(-1, 1, 2))
+                            rect = cv2.minAreaRect(hull)
+                            box = cv2.boxPoints(rect)
+                            
+                            if self._validate_multilevel_region(box, gray, level):
+                                score = cv2.contourArea(box)
+                                level_regions_scores.append((box, score, level))
+
+                    except Exception as e:
+                        logger.warning(f"MSER级别{level}失败: {e}")
+                
+                stats['raw_regions_per_level'].append(len(level_regions_scores))
+                all_regions_with_scores_levels.extend(level_regions_scores)
+                stats['levels_processed'] += 1
             
-            return regions, stats
+            if not all_regions_with_scores_levels:
+                return [], stats
+
+            boxes = [item[0] for item in all_regions_with_scores_levels]
+            scores = [item[1] for item in all_regions_with_scores_levels]
+            rects_for_nms = [cv2.boundingRect(box.astype(np.int32)) for box in boxes]
+            
+            indices = cv2.dnn.NMSBoxes(rects_for_nms, scores, score_threshold=0.1, nms_threshold=0.4)
+            
+            final_regions = []
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    final_regions.append(boxes[i].astype(np.float32))
+
+            return final_regions, stats
             
         except Exception as e:
             logger.error(f"多层次MSER检测失败: {e}")
@@ -1592,30 +1990,38 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             return [0.0]
     
     def _detect_horizontal_text_regions(self, gray: np.ndarray) -> List[np.ndarray]:
-        """检测水平文本区域"""
+        """
+        检测水平文本区域。
+        此方法专门优化用于检测横向排列的文本行。
+        它使用自适应阈值和水平方向的形态学操作来连接字符，
+        然后提取轮廓并根据宽高比进行过滤。
+        """
         try:
             regions = []
 
             # 针对水平文本优化的形态学操作
+            # 修正：将所有 'cv.' 替换为 'cv2.'
             binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY_INV, 11, 2)
+                                           cv2.THRESH_BINARY_INV, 11, 2)
 
-            # 水平连接核
+            # 水平连接核，用于连接同一行内的字符
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 1))
+            # 闭运算连接断裂的文本部分
             horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, horizontal_kernel)
 
-            # 查找水平文本区域
+            # 查找水平文本区域的轮廓
             contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
             for contour in contours:
                 area = cv2.contourArea(contour)
+                # 过滤掉过小的噪声区域
                 if area > self.config['min_text_size'] ** 2:
                     # 获取边界矩形
                     x, y, w, h = cv2.boundingRect(contour)
 
-                    # 验证是否为水平文本
+                    # 验证是否为水平文本：宽度远大于高度
                     aspect_ratio = w / h if h > 0 else 0
-                    if aspect_ratio > 1.5:  # 水平文本的宽高比应该大于1.5
+                    if aspect_ratio > 1.5:  # 水平文本的宽高比通常大于1.5
                         box = np.array([
                             [x, y],
                             [x + w, y],
@@ -1623,13 +2029,13 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
                             [x, y + h]
                         ], dtype=np.float32)
                         regions.append(box)
-
-            return regions # <-- Added return statement here
-
-        except Exception as e: # <-- Added the 'except' block here
-            logger.error(f"水平文本检测失败: {e}")
-            return []
             
+            return regions
+
+        except Exception as e:
+            # 捕获任何潜在错误并记录，返回空列表
+            logger.error(f"水平文本检测失败: {e}")
+            return []     
     def _ultra_precise_merging(self, regions: List[np.ndarray], gray: np.ndarray) -> List[np.ndarray]:
         """超精确合并"""
         try:
@@ -2054,6 +2460,319 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
         except Exception:
             return False
 
+
+
+class PPOCRv3TextDetector:
+    """
+    使用OpenCV DNN模块和PP-OCRv3模型的现代文本检测器。
+    这是当前OpenCV Zoo中官方支持的稳定方案。
+    """
+    def __init__(self, model_name="text_detection_cn_ppocrv3_2023may.onnx", threshold=0.3, nms_threshold=0.4):
+        # 直接使用传入的模型文件名
+        self.model_name = model_name
+            
+        self.threshold = threshold
+        self.nms_threshold = nms_threshold
+        self.net = None
+        self.input_size = (736, 736)
+        self._initialize_model()
+
+    def _download_model(self, model_path, url):
+        """下载PP-OCRv3模型文件"""
+        if requests is None:
+            logger.error("❌ PP-OCRv3模型下载失败：'requests'库未安装。")
+            return False
+        try:
+            logger.info(f"PP-OCRv3模型文件 '{model_path}' 不存在，正在从官方源下载...")
+            with requests.get(url, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                with open(model_path, 'wb') as f:
+                    shutil.copyfileobj(r.raw, f)
+            logger.info(f"✅ PP-OCRv3模型下载成功，已保存至: {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ PP-OCRv3模型下载失败: {e}", exc_info=True)
+            if os.path.exists(model_path):
+                os.remove(model_path)
+            return False
+
+    def _initialize_model(self):
+        """初始化模型，如果不存在则下载"""
+        model_url = f"https://raw.githubusercontent.com/opencv/opencv_zoo/main/models/text_detection_ppocr/{self.model_name}"
+        
+        if not os.path.exists(self.model_name):
+            if not self._download_model(self.model_name, model_url):
+                error_message = (
+                    "PP-OCRv3 文本检测模型自动下载失败！\n\n"
+                    "这将导致高级文本分割功能无法使用。\n\n"
+                    "请手动从以下地址下载模型：\n"
+                    f"{model_url}\n\n"
+                    f"然后将 '{self.model_name}' 文件放置于程序运行目录下，并重启程序。"
+                )
+                logger.error(error_message)
+                try:
+                    messagebox.showerror("关键模型下载失败", error_message)
+                except Exception:
+                    pass
+                return
+
+        try:
+            self.net = cv2.dnn.readNet(self.model_name)
+            logger.info(f"✅ PP-OCRv3文本检测模型 '{self.model_name}' 加载成功。")
+        except Exception as e:
+            logger.error(f"❌ 加载PP-OCRv3模型失败: {e}", exc_info=True)
+            self.net = None
+
+    def detect_text_regions_advanced(self, image: np.ndarray, 
+                                 enabled_algorithms: Optional[List[str]] = None) -> Tuple[List[np.ndarray], Dict]:
+        """
+        使用PP-OCRv3进行高级文本区域检测。
+        """
+        if self.net is None:
+            logger.error("PP-OCRv3模型未加载，无法进行文本检测。")
+            return [], {'error': 'PP-OCRv3 model not loaded'}
+
+        start_time = time.time()
+        
+        original_height, original_width = image.shape[:2]
+        
+        blob = cv2.dnn.blobFromImage(image, scalefactor=1.0/255.0, size=self.input_size, mean=(122.67891434, 116.66876762, 104.00698793), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        
+        # --- 关键修正：正确处理多输出模型 ---
+        # .forward() 对于多输出模型返回一个元组或列表
+        outputs = self.net.forward()
+
+        # 根据PP-OCRv3的结构，第一个输出是scores，第二个是geometry
+        # 它们的形状通常是 (N, C, H, W)，我们需要去掉多余的批处理(N)和通道(C)维度
+        scores = outputs[0].squeeze()   # squeeze() 会移除所有大小为1的维度
+        geometry = outputs[1].squeeze() # 例如 (1, 5, H, W) -> (5, H, W)
+        
+        if scores.ndim != 2 or geometry.ndim != 3 or geometry.shape[0] != 5:
+            error_msg = f"Unexpected output shapes after squeeze. Scores: {scores.shape}, Geometry: {geometry.shape}"
+            logger.error(error_msg)
+            return [], {'error': error_msg}
+        # --- 修正结束 ---
+
+        rects, confidences = self._decode_predictions(scores, geometry)
+        
+        indices = cv2.dnn.NMSBoxesRotated(rects, confidences, self.threshold, self.nms_threshold)
+        
+        final_regions = []
+        if len(indices) > 0:
+            scale_x = original_width / self.input_size[0]
+            scale_y = original_height / self.input_size[1]
+            for i in indices:
+                rot_rect = rects[i]
+                # 调整旋转矩形的中心点和大小以匹配原始图像尺寸
+                (cx, cy), (w, h), angle = rot_rect
+                orig_cx, orig_cy = cx * scale_x, cy * scale_y
+                orig_w, orig_h = w * scale_x, h * scale_y
+                
+                # 获取缩放后的旋转矩形的四个角点
+                points = cv2.boxPoints(((orig_cx, orig_cy), (orig_w, orig_h), angle))
+                final_regions.append(points.astype(np.float32))
+
+        processing_time = time.time() - start_time
+        metadata = {
+            'processing_time': processing_time,
+            'detection_mode': 'ppocr_v3', # <--- 使用一个固定的值或移除此键
+            'total_regions': len(final_regions),
+            'detection_method': 'PP-OCRv3'
+        }
+        
+        logger.info(f"PP-OCRv3文本检测完成: {len(final_regions)}个区域, 耗时: {processing_time:.3f}秒")
+        return final_regions, metadata
+
+    def _decode_predictions(self, scores, geometry):
+        """从模型输出解码边界框和置信度 (适配PP-OCR的EAST-like输出)"""
+        rects = []
+        confidences = []
+        height, width = scores.shape
+        
+        for y in range(height):
+            for x in range(width):
+                score = scores[y, x]
+                if score < self.threshold:
+                    continue
+                
+                # 几何信息解码
+                geo = geometry[:, y, x]
+                d1, d2, d3, d4, angle = geo
+                
+                # 计算旋转矩形
+                cos, sin = math.cos(angle), math.sin(angle)
+                offset_x, offset_y = x * 4.0, y * 4.0
+                
+                box_height = d1 + d3
+                box_width = d2 + d4
+                
+                # 计算中心点
+                center_x = offset_x + cos * (d2 - d4) / 2 - sin * (d1 - d3) / 2
+                center_y = offset_y + sin * (d2 - d4) / 2 + cos * (d1 - d3) / 2
+                
+                # PP-OCR的旋转角度定义是从水平轴逆时针，范围[-45, 45]，OpenCV需要度数
+                angle_deg = angle * (180 / math.pi)
+                
+                rot_rect = ((center_x, center_y), (box_width, box_height), angle_deg)
+                
+                rects.append(rot_rect)
+                confidences.append(float(score))
+                
+        return rects, confidences
+class UnifiedObjectDetector:
+    """
+    一个统一的目标检测器，使用YOLOv4-tiny识别文本、表格和基础图形。
+    版本: 2.0 - 实现了模型的自动下载、验证与加载。
+    """
+    def __init__(self, logger_func: Callable, cfg_path: str, weights_path: str, names_path: str):
+        """
+        UnifiedObjectDetector 的构造函数 (V3.32 - 用户可配置模型版)。
+        - 使用用户提供的路径加载YOLOv4-tiny模型。
+        - 不再执行自动下载，只检查文件是否存在。
+        """
+        self.log = logger_func
+        self.net = None
+        self.classes = []
+        self.output_layers = []
+        self.class_map = {
+            "person": "text", "book": "text", "cell phone": "text",
+            "laptop": "graphic", "tv": "graphic", "remote": "graphic",
+            "dining table": "table"
+        }
+
+        # 1. 检查用户提供的文件是否存在
+        for path, name in [(weights_path, "权重文件"), (cfg_path, "配置文件"), (names_path, "类别文件")]:
+            if not os.path.exists(path):
+                self.log(f"❌ YOLO {name} '{path}' 不存在，统一对象检测功能将不可用。", "ERROR")
+                messagebox.showerror("YOLO模型文件缺失", f"YOLO {name}未找到：\n{path}\n\n请在“全元素检测引擎”设置中指定正确的文件路径。")
+                return
+
+        # 2. 尝试加载YOLO网络
+        try:
+            self.net = cv2.dnn.readNetFromDarknet(cfg_path, weights_path)
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+            with open(names_path, "r", encoding='utf-8') as f:
+                self.classes = [line.strip() for line in f.readlines()]
+
+            layer_names = self.net.getLayerNames()
+            unconnected_layers_indices = self.net.getUnconnectedOutLayers()
+            if isinstance(unconnected_layers_indices, np.ndarray):
+                unconnected_layers_indices = unconnected_layers_indices.flatten()
+            self.output_layers = [layer_names[i - 1] for i in unconnected_layers_indices]
+            
+            self.log("✅ 用户指定的YOLOv4-tiny统一对象检测器加载成功。", "SUCCESS")
+
+        except Exception as e:
+            self.log(f"❌ 加载用户指定的YOLO模型失败: {e}", "ERROR")
+            messagebox.showerror("YOLO模型加载失败", f"加载YOLO模型时出错：\n{e}\n\n请检查文件是否正确且未损坏。")
+            self.net = None
+    
+    
+    
+    
+    def detect_all_objects(self, image: np.ndarray) -> List[Dict]:
+        """
+        在图像中检测所有对象（文本、表格、图形）。
+        这是一个混合方法，结合了YOLO的深度学习检测和经典CV的轮廓分析。
+        Args:
+            image (np.ndarray): 输入的BGR图像。
+        Returns:
+            List[Dict]: 包含所有检测到对象信息的列表。
+        """
+        if self.net is None:
+            self.log("⚠️ YOLO网络未加载，跳过统一对象检测。", "WARNING")
+            return []
+
+        height, width, _ = image.shape
+        
+        # 1. 使用YOLO进行深度学习对象检测
+        blob = cv2.dnn.blobFromImage(image, 1/255.0, (416, 416), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        outs = self.net.forward(self.output_layers)
+
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        for out in outs:
+            for detection in out:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                if confidence > 0.3:  # 置信度阈值
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w = int(detection[2] * width)
+                    h = int(detection[3] * height)
+                    x = int(center_x - w / 2)
+                    y = int(center_y - h / 2)
+                    boxes.append([x, y, w, h])
+                    confidences.append(float(confidence))
+                    class_ids.append(class_id)
+        
+        # 应用非极大值抑制（NMS）以消除重叠的边界框
+        indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.3, 0.4)
+        
+        detected_objects = []
+        if len(indexes) > 0:
+            for i in indexes.flatten():
+                x, y, w, h = boxes[i]
+                label = self.classes[class_ids[i]]
+                
+                # 使用类别映射转换标签
+                mapped_label = self.class_map.get(label, "unknown")
+                
+                # 只添加被映射为有效类别的对象
+                if mapped_label != "unknown":
+                    detected_objects.append({
+                        "bbox": [x, y, x + w, y + h],
+                        "label": mapped_label,
+                        "confidence": confidences[i]
+                    })
+
+        # 2. 使用经典计算机视觉方法补充基础图形检测
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        canny_edges = cv2.Canny(gray, 50, 150)
+        contours, _ = cv2.findContours(canny_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 200 or area > width * height * 0.8:
+                continue
+
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.03 * peri, True)
+            x, y, w, h = cv2.boundingRect(approx)
+            shape_label = "unknown"
+
+            if len(approx) == 4:
+                roi = gray[y:y+h, x:x+w]
+                # 棋盘格/图案的特征：内部有大量角点
+                corners = cv2.goodFeaturesToTrack(roi, 30, 0.01, 10)
+                if corners is not None and len(corners) > 20:
+                    shape_label = "pattern"
+                else:
+                    shape_label = "rectangle"
+            elif len(approx) > 7: # 近似为圆
+                (cx, cy), radius = cv2.minEnclosingCircle(contour)
+                circle_area = np.pi * (radius ** 2)
+                if circle_area > 0 and 0.8 < area / circle_area < 1.2:
+                    shape_label = "ellipse"
+
+            # 线条的特征：宽高比极端
+            if w > h * 8 or h > w * 8:
+                shape_label = "line"
+            
+            if shape_label != "unknown":
+                detected_objects.append({
+                    "bbox": [x, y, x + w, y + h],
+                    "label": shape_label,
+                    "confidence": 0.95  # 几何方法确定性高，给一个较高的置信度
+                })
+
+        return detected_objects
 class OCRLanguage(Enum):
     """OCR语言枚举"""
     AUTO = "auto"          # 自动检测
@@ -2064,7 +2783,7 @@ class OCRLanguage(Enum):
     KOREAN = "kor"         # 韩文
     MULTI = "chi_sim+eng"  # 中英混合
 
-### 修正3: 添加 TextQualityLevel 枚举定义
+
 class TextQualityLevel(Enum):
     """文本图像质量等级枚举"""
     EXCELLENT = "excellent" # 优秀
@@ -2078,7 +2797,6 @@ class CVOCRException(Exception):
         super().__init__(message)
         self.error_code = error_code
         self.details = details or {}
-
 
 
 
@@ -2127,7 +2845,8 @@ class CVOCRVersionManager:
             
             version = pytesseract.get_tesseract_version()
             
-            if original_cmd is not None: # <--- 修正4: 将 `is == None` 替换为 `is None`
+            
+            if original_cmd is not None: 
                 pytesseract.pytesseract.tesseract_cmd = original_cmd # 恢复原路径
             return str(version)
         except ImportError:
@@ -2259,16 +2978,30 @@ class CVOCRVersionManager:
         }
         
         # 获取其他库版本
-        for lib_name in ['numpy', 'PIL', 'tkinter', 'psutil']: # <--- 修正5: 添加 psutil 到版本检查
+        # --- 修正5: 添加 'psutil' 到版本检查列表 ---
+        for lib_name in ['numpy', 'PIL', 'tkinter', 'psutil']:
             try:
                 lib = __import__(lib_name)
-                versions[lib_name] = getattr(lib, '__version__', 'unknown')
+                # tkinter and PIL might not have __version__ in the same way
+                if lib_name == 'PIL':
+                    # Pillow库的版本信息存储在PIL.__version__
+                    from PIL import __version__ as pil_version
+                    versions[lib_name] = pil_version
+                elif lib_name == 'tkinter':
+                    # tkinter的版本与其依赖的Tcl/Tk版本相关
+                    import tkinter as tk
+                    versions[lib_name] = tk.Tcl().eval('info patchlevel')
+                else:
+                    # 对于大多数库，可以直接获取__version__属性
+                    versions[lib_name] = getattr(lib, '__version__', 'unknown')
             except ImportError:
                 versions[lib_name] = 'not installed'
             except Exception:
                 versions[lib_name] = 'unknown'
         
         return versions
+        
+        
 class AdvancedTextImageProcessor:
     """高级文本图像处理器 - 为OCR识别优化"""
     
@@ -2399,10 +3132,10 @@ class AdvancedTextImageProcessor:
     
     def intelligent_preprocess_image(self, image_path: str, **options) -> Tuple[Optional[np.ndarray], str, Dict]:
         """
-        智能图像预处理核心方法 (V3.8 最终纯净版)
-        - 彻底分离预处理职责：为高级分割时，只做最基础的尺寸和通道准备。
-        - 为整页识别时，执行全面的自适应预处理。
-        - 当预处理被禁用时，仅进行尺寸优化。
+        【最终重构版】智能图像预处理核心方法
+        - 根据用户设置（全元素检测 vs 纯文本识别）选择合适的预处理策略。
+        - 动态应用UI选项，确保用户设置在所有子流程中生效。
+        - 为预览和日志提供清晰、详细的处理步骤信息。
         """
         start_time = time.time()
         
@@ -2412,8 +3145,12 @@ class AdvancedTextImageProcessor:
             if not is_valid:
                 logger.error(f"图像验证失败: {validation_msg}")
                 return None, f"图像验证失败: {validation_msg}", {}
+
+            # 2. 关键步骤：将传入的options动态更新到实例配置中
+            self.config.update(options)
+            logger.debug(f"DEBUG: Preprocessing config updated with options from UI: {options}")
             
-            # 2. 生成缓存键并检查缓存
+            # 3. 生成缓存键并检查缓存
             cache_key = self._generate_cache_key(image_path, options)
             cached_result = self._get_from_cache(cache_key)
             if cached_result is not None:
@@ -2423,7 +3160,7 @@ class AdvancedTextImageProcessor:
             
             self._processing_stats['cache_misses'] += 1
             
-            # 3. 读取图像
+            # 4. 读取图像
             image = cv2.imread(image_path)
             if image is None:
                 try:
@@ -2435,80 +3172,59 @@ class AdvancedTextImageProcessor:
             original_shape = image.shape
             logger.info(f"开始智能OCR预处理图像: {image_path}, 原始尺寸: {original_shape}")
             
-            # 4. 根据 options 决定预处理策略
-            enable_preprocessing = options.get('enable_preprocessing', False)
-            use_advanced_segmentation = options.get('enable_advanced_segmentation', False)
+            # 5. 根据更新后的 self.config 决定预处理策略
+            enable_preprocessing = self.config.get('enable_preprocessing', False)
+            use_advanced_segmentation = self.config.get('enable_advanced_segmentation', False)
             
             processed_image = image.copy()
             process_operations = []
             quality_level = TextQualityLevel.FAIR
             quality_metrics = {}
 
-            if enable_preprocessing and use_advanced_segmentation:
-                # **流程A: 为高级分割准备输入**
-                # 此流程的目标是为分割引擎提供一张干净、结构完整的图像。
-                # 只做最基础、最安全的操作，将所有复杂处理留到分割之后。
-                logger.info("高级分割模式启用：执行最基础的图像准备。")
-                
-                # (1) 尺寸优化：确保图像在合适的尺寸范围内
-                processed_image = self._optimize_image_size(processed_image)
-                process_operations.append("基础尺寸优化")
-                
-                # (2) 确保是BGR格式：这是分割引擎所期望的输入格式
-                if len(processed_image.shape) == 2:
-                    processed_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
-                elif processed_image.shape[2] == 4: # 处理RGBA
-                    processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGRA2BGR)
-                
-                # (3) （可选但推荐）进行安全的几何校正
-                if options.get('enable_deskew', self.config['enable_deskew']):
-                    gray_for_deskew = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                    deskewed_gray, angle = self._deskew_image(gray_for_deskew, options.get('deskew_angle_threshold', self.config['deskew_angle_threshold']))
-                    if angle != 0.0:
-                        # 对原始尺寸的BGR图像应用旋转
-                        center = (image.shape[1] // 2, image.shape[0] // 2)
-                        rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-                        processed_image = cv2.warpAffine(processed_image, rotation_matrix,
-                                                   (image.shape[1], image.shape[0]),
-                                                   flags=cv2.INTER_CUBIC,
-                                                   borderMode=cv2.BORDER_REPLICATE)
-                        process_operations.append(f"倾斜校正 ({angle:.2f}度)")
-
-            elif enable_preprocessing and not use_advanced_segmentation:
-                # **流程B: 为整页识别进行全面的自适应预处理**
-                logger.info("整页识别模式启用：执行全面的自适应预处理。")
-                
-                # (1) 评估图像质量
-                quality_level, quality_metrics = self.assess_text_image_quality(image)
-                
-                # (2) 根据质量或强制设置，选择合适的处理强度
-                if options.get('force_intensive_preprocessing', False):
-                    processed_image, process_operations = self._intensive_text_preprocessing(image, **options)
+            if enable_preprocessing:
+                if use_advanced_segmentation:
+                    logger.info("工作流: 为全元素检测准备图像（简化预处理）")
+                    process_operations.append("[模式: 全元素检测准备]")
+                    processed_image = self._optimize_image_size(processed_image)
+                    process_operations.append("尺寸与通道标准化")
+                    if len(processed_image.shape) == 2:
+                        processed_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
+                    elif processed_image.shape[2] == 4:
+                        processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGRA2BGR)
+                    if self.config.get('enable_deskew', False):
+                        gray_for_deskew = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                        deskewed_gray, angle = self._deskew_image(gray_for_deskew, self.config.get('deskew_angle_threshold', 0.5))
+                        if angle != 0.0:
+                            center = (image.shape[1] // 2, image.shape[0] // 2)
+                            rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+                            processed_image = cv2.warpAffine(processed_image, rotation_matrix,
+                                                       (image.shape[1], image.shape[0]),
+                                                       flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                            process_operations.append(f"倾斜校正({angle:.2f}°)")
+                    process_operations.append("(注: 此模式下跳过复杂增强以保证检测精度)")
                 else:
-                    processed_image, process_operations = self.adaptive_text_preprocessing(image, quality_level, **options)
-            
-            else: # not enable_preprocessing
-                # **流程C: 禁用智能预处理**
-                logger.info("智能预处理已禁用，只进行基础尺寸优化。")
-                
-                # (1) 仅进行尺寸优化
+                    logger.info("工作流: 为整页纯文本识别进行全面预处理")
+                    process_operations.append("[模式: 整页纯文本识别]")
+                    processed_image, adaptive_ops = self.adaptive_text_preprocessing(image, **self.config)
+                    process_operations.extend(adaptive_ops)
+            else:
+                logger.info("工作流: 智能预处理已禁用")
+                process_operations.append("[模式: 预处理已禁用]")
                 processed_image = self._optimize_image_size(image)
                 process_operations.append("基础尺寸优化")
-                
-                # (2) 确保输出是3通道BGR
                 if len(processed_image.shape) == 2:
                     processed_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
-                    process_operations.append("灰度转BGR (最终)")
-            
-            # 5. 记录处理时间和元数据
+                    process_operations.append("灰度转BGR")
+
+            # 6. 记录处理时间和元数据
             processing_time = time.time() - start_time
             self._update_processing_stats(processing_time)
             
-            precision_level_opt = options.get('precision_level', OCRPrecisionLevel.BALANCED)
-            precision_level_str = precision_level_opt.value if isinstance(precision_level_opt, Enum) else str(precision_level_opt)
+            
+            
 
             metadata = {
-                'precision_level': precision_level_str,
+                
                 'quality_level': quality_level.value if enable_preprocessing and not use_advanced_segmentation else 'N/A',
                 'quality_score': quality_metrics.get('quality_score', 0) if enable_preprocessing and not use_advanced_segmentation else 'N/A',
                 'quality_metrics': quality_metrics if enable_preprocessing and not use_advanced_segmentation else {},
@@ -2520,7 +3236,7 @@ class AdvancedTextImageProcessor:
                 'timestamp': datetime.now().isoformat()
             }
             
-            # 6. 将处理结果添加到缓存
+            # 7. 将处理结果添加到缓存
             cache_data = {
                 'image': processed_image.copy(),
                 'message': "智能OCR预处理成功" if enable_preprocessing else "基础处理成功",
@@ -2536,12 +3252,13 @@ class AdvancedTextImageProcessor:
             return processed_image, success_msg, metadata
             
         except CVOCRException as e:
-            # 重新抛出自定义异常，让上层处理
             raise e
         except Exception as e:
             error_msg = f"智能OCR预处理失败: {str(e)}"
             logger.error(f"{error_msg}\n{traceback.format_exc()}")
             return None, error_msg, {'error': str(e), 'traceback': traceback.format_exc()}
+    
+    
     
     
     def assess_text_image_quality(self, image: np.ndarray) -> Tuple[TextQualityLevel, Dict]:
@@ -2753,298 +3470,128 @@ class AdvancedTextImageProcessor:
     
     def adaptive_text_preprocessing(self, image: np.ndarray, quality_level: TextQualityLevel = None, **options) -> Tuple[np.ndarray, List[str]]:
         """
-        基于图像质量评估的自适应文本预处理。
-        根据检测到的图像质量等级，选择不同的预处理强度。
+        【V4.1 - 完全手动控制最终版】
+        预处理流程严格由用户通过 `options` 字典传递的开关决定。
+        废除所有基于图像质量的自动判断策略，实现完全的用户控制。
         """
         try:
-            if quality_level is None:
-                quality_level, _ = self.assess_text_image_quality(image)
-            
-            processed_image = image.copy()
             operations = []
+            # 从原始图像开始，根据后续步骤决定是否转换颜色空间
+            processed_image = image.copy()
             
-            # 统一转换为灰度图 (如果不是)
-            if len(processed_image.shape) == 3:
-                processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                operations.append("转换为灰度图")
+            # --- 核心流程：严格按照用户开关顺序执行 ---
 
-            # 图像几何校正和边框处理 (始终执行，因为这些是基础且重要的修正)
-            # 倾斜校正
-            if options.get('enable_deskew', self.config['enable_deskew']):
-                deskewed_image, angle = self._deskew_image(processed_image, options.get('deskew_angle_threshold', self.config['deskew_angle_threshold']))
+            # 步骤 1: 转换为灰度图 (如果启用)
+            # 这是后续很多操作的基础
+            is_gray = False
+            if options.get('enable_grayscale', False):
+                if len(processed_image.shape) == 3:
+                    processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                    operations.append("转换为灰度图")
+                is_gray = True
+            
+            # 步骤 2: 几何校正
+            if options.get('enable_deskew', False):
+                # 确保有灰度图用于倾斜检测
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                deskewed_image, angle = self._deskew_image(gray_for_op, options.get('deskew_angle_threshold', 0.5))
                 if angle != 0.0:
-                    processed_image = deskewed_image
-                    operations.append(f"倾斜校正 ({angle:.2f}度)")
+                    # 将旋转应用到当前正在处理的图像上（可能是彩色或灰度）
+                    center = (processed_image.shape[1] // 2, processed_image.shape[0] // 2)
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    processed_image = cv2.warpAffine(processed_image, M, (processed_image.shape[1], processed_image.shape[0]), 
+                                                     flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    operations.append(f"几何: 倾斜校正({angle:.2f}°)")
             
-            # 阴影移除
-            if options.get('shadow_removal', self.config['shadow_removal']):
-                processed_image = self._remove_shadows(processed_image)
-                operations.append("阴影移除")
+            if options.get('page_border_detection', False):
+                 # 页面检测最好在接近原始的图像上做
+                 img_for_detect = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+                 processed_after_perspective = self._detect_and_crop_page(img_for_detect)
+                 if processed_after_perspective.shape != img_for_detect.shape:
+                     processed_image = processed_after_perspective
+                     # 如果经过此步骤，图像肯定是灰度图了
+                     is_gray = True
+                     operations.append("几何: 页面检测与校正")
 
-            # 边框和内容裁剪
-            if options.get('remove_borders', self.config['remove_borders']) or options.get('page_border_detection', self.config['page_border_detection']):
-                processed_image = self._process_borders(processed_image, 
-                                                    remove_borders=options.get('remove_borders', self.config['remove_borders']),
-                                                    border_threshold=options.get('border_threshold', self.config['border_threshold']),
-                                                    page_border_detection=options.get('page_border_detection', self.config['page_border_detection']))
-                operations.append("边框处理/页面检测")
+            # 步骤 3: 图像增强与清理 (这些操作通常在灰度图上效果更好)
+            if options.get('shadow_removal', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                processed_image = self._remove_shadows(gray_for_op)
+                is_gray = True
+                operations.append("增强: 阴影移除")
             
-            if options.get('crop_to_content', self.config['crop_to_content']):
-                cropped_image, crop_success = self._crop_to_content(processed_image)
-                if crop_success:
-                    processed_image = cropped_image
-                    operations.append("裁剪到内容")
-            
-            # 根据质量等级选择处理策略
-            if quality_level == TextQualityLevel.POOR:
-                processed_image, ops = self._intensive_text_preprocessing(processed_image, **options)
-                operations.extend(ops)
-            elif quality_level == TextQualityLevel.FAIR:
-                processed_image, ops = self._moderate_text_preprocessing(processed_image, **options)
-                operations.extend(ops)
-            elif quality_level == TextQualityLevel.GOOD:
-                processed_image, ops = self._light_text_preprocessing(processed_image, **options)
-                operations.extend(ops)
-            else:  # EXCELLENT (质量优秀，最少处理)
-                processed_image, ops = self._minimal_text_preprocessing(processed_image, **options)
-                operations.extend(ops)
-            
-            # 确保最终输出图像是3通道BGR (以便Tesseract或后续AI模型处理)
-            if len(processed_image.shape) == 2:
-                processed_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
-                operations.append("灰度转BGR (最终)")
-            elif processed_image.shape[2] == 4:  # RGBA转BGR
-                processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGRA2BGR)
-                operations.append("RGBA转BGR")
-            
-            return processed_image, operations
-            
-        except Exception as e:
-            logger.error(f"自适应文本预处理失败: {e}\n{traceback.format_exc()}")
-            # 失败时返回原始图像的灰度/BGR版本，并记录错误
-            if len(image.shape) == 2:
-                return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), ['预处理异常']
-            return image, ['预处理异常']
-    
-    def _intensive_text_preprocessing(self, gray_image: np.ndarray, **options) -> Tuple[np.ndarray, List[str]]:
-        """
-        高强度文本预处理，适用于低质量、复杂背景或有严重干扰的图像。
-        采用多种高级技术，如高级降噪、CLAHE、Gamma校正、反锐化掩模和形态学操作。
-        """
-        operations = []
-        
-        try:
-            processed_image = gray_image.copy()
-            logger.debug("DEBUG: 执行高强度预处理 - 输入为灰度图。")
-            
-            # 高级降噪 (非局部均值降噪)
-            denoise_strength = options.get('denoise_strength', self.config['denoise_strength'])
-            edge_preservation = options.get('edge_preservation', self.config['edge_preservation'])
-            if denoise_strength > 0:
-                processed_image = self._advanced_denoising(processed_image, denoise_strength, edge_preservation)
-                operations.append("高级降噪")
-                logger.debug("DEBUG: 执行高强度预处理 - 高级降噪。")
-
-            # 双边滤波去噪 (保留边缘)
-            if options.get('bilateral_filter', self.config['bilateral_filter']):
-                d_val = options.get('bilateral_d', self.config['bilateral_d'])
-                sigma_color = options.get('bilateral_sigma_color', self.config['bilateral_sigma_color'])
-                sigma_space = options.get('bilateral_sigma_space', self.config['bilateral_sigma_space'])
+            if options.get('bilateral_filter', False):
+                # 双边滤波可以作用于彩色或灰度图
                 processed_image = cv2.bilateralFilter(processed_image, 
-                                                    d_val, 
-                                                    int(sigma_color), # OpenCV expects int
-                                                    int(sigma_space)) # OpenCV expects int
-                operations.append("双边滤波去噪")
-                logger.debug("DEBUG: 执行高强度预处理 - 双边滤波去噪。")
+                                                   d=options.get('bilateral_d', 9),
+                                                   sigmaColor=int(options.get('bilateral_sigma_color', 75.0)),
+                                                   sigmaSpace=int(options.get('bilateral_sigma_space', 75.0)))
+                operations.append("降噪: 双边滤波")
             
-            # CLAHE直方图均衡化 (增强局部对比度)
-            if options.get('apply_clahe', self.config['apply_clahe']):
-                clahe_clip_limit = options.get('clahe_clip_limit', self.config['clahe_clip_limit'])
-                clahe_tile_grid_size = options.get('clahe_tile_grid_size', self.config['clahe_tile_grid_size'])
-                clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_tile_grid_size)
-                processed_image = clahe.apply(processed_image)
-                operations.append("CLAHE直方图均衡化")
-                logger.debug("DEBUG: 执行高强度预处理 - CLAHE直方图均衡化。")
+            if options.get('histogram_equalization', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                processed_image = cv2.equalizeHist(gray_for_op)
+                is_gray = True
+                operations.append("增强: 直方图均衡化")
             
-            # Gamma校正 (调整整体亮度分布)
-            gamma_val = options.get('gamma_correction', self.config['gamma_correction_range'][1]) # 使用配置中的上限
-            inv_gamma = 1.0 / gamma_val
-            gamma_table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype(np.uint8)
-            processed_image = cv2.LUT(processed_image, gamma_table)
-            operations.append(f"Gamma校正 (γ={gamma_val})")
-            logger.debug("DEBUG: 执行高强度预处理 - Gamma校正。")
-            
-            # 全局直方图均衡化
-            if options.get('histogram_equalization', self.config['histogram_equalization']):
-                processed_image = cv2.equalizeHist(processed_image)
-                operations.append("全局直方图均衡化")
-                
-            # 锐化或反锐化掩模
-            if options.get('unsharp_mask', self.config['unsharp_mask']):
-                unsharp_radius = options.get('unsharp_radius', self.config['unsharp_radius'])
-                unsharp_amount = options.get('unsharp_amount', self.config['unsharp_amount'])
-                processed_image = self._unsharp_mask(processed_image, unsharp_radius, unsharp_amount)
-                operations.append("反锐化掩模")
+            if options.get('apply_clahe', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                clahe = cv2.createCLAHE(clipLimit=options.get('clahe_clip_limit', 2.0), 
+                                      tileGridSize=options.get('clahe_tile_grid_size', (8, 8)))
+                processed_image = clahe.apply(gray_for_op)
+                is_gray = True
+                operations.append("增强: CLAHE")
+
+            if options.get('unsharp_mask', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                processed_image = self._unsharp_mask(gray_for_op, 
+                                              radius=options.get('unsharp_radius', 1.0), 
+                                              amount=options.get('unsharp_amount', 1.0))
+                is_gray = True
+                operations.append("增强: 反锐化掩模")
+
+            # 步骤 4: 二值化 (如果启用)
+            if options.get('enable_binarization', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                block_size = options.get('adaptive_block_size', 11); C_val = options.get('adaptive_c_constant', 2)
+                if block_size % 2 == 0: block_size += 1
+                processed_image = cv2.adaptiveThreshold(gray_for_op, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                        cv2.THRESH_BINARY_INV, block_size, C_val)
+                is_gray = True # 二值化后肯定是单通道图
+                operations.append("转换: 自适应二值化")
+
+            # 步骤 5: 最终裁剪操作 (通常在二值化后效果更好)
+            if options.get('remove_borders', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                processed_image = self._remove_borders(gray_for_op, options.get('border_threshold', 10))
+                is_gray = True
+                operations.append("几何: 移除边框")
+
+            if options.get('crop_to_content', False):
+                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
+                processed_image, _ = self._crop_to_content(gray_for_op)
+                is_gray = True
+                operations.append("几何: 裁剪到内容")
+
+            # --- 最终输出准备 ---
+            # OCR引擎通常需要3通道BGR图像，这是为了最好的兼容性
+            if is_gray:
+                final_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
+                operations.append("输出: 转换为BGR")
             else:
-                kernel_sharpen = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]]) # 更强的锐化核
-                processed_image = cv2.filter2D(processed_image, -1, kernel_sharpen)
-                operations.append("锐化处理")
-            logger.debug("DEBUG: 执行高强度预处理 - 锐化处理。")
+                final_image = processed_image
 
-            # 自适应二值化 (适应光照不均，更精细的块大小)
-            block_size = options.get('adaptive_block_size', self.config['adaptive_block_size'])
-            C_value = options.get('adaptive_c_constant', self.config['adaptive_c_constant']) 
-            if block_size % 2 == 0: # 确保 block_size 是奇数
-                block_size += 1
-            processed_image = cv2.adaptiveThreshold(processed_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                                    cv2.THRESH_BINARY, block_size, C_value)
-            operations.append("自适应二值化")
-            logger.debug("DEBUG: 执行高强度预处理 - 自适应二值化。")
-            
-            # 形态学操作去除小噪点和连接断裂 (先闭运算连接，再开运算去噪)
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)) # 稍微大一点的核
-            processed_image = cv2.morphologyEx(processed_image, cv2.MORPH_CLOSE, kernel_close)
-            operations.append("形态学闭运算")
-            logger.debug("DEBUG: 执行高强度预处理 - 形态学闭运算。")
+            if not operations:
+                operations.append("无任何预处理操作")
 
-            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-            processed_image = cv2.morphologyEx(processed_image, cv2.MORPH_OPEN, kernel_open)
-            operations.append("形态学开运算")
-            logger.debug("DEBUG: 执行高强度预处理 - 形态学开运算。")
-            
-            # 去除小连通域 (进一步去除图形干扰)
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(processed_image, connectivity=8)
-            min_area = 50  # 最小连通域面积，适当增大以去除小的图形或线条
-            output_image = np.zeros_like(processed_image)
-            for i in range(1, num_labels):
-                if stats[i, cv2.CC_STAT_AREA] > min_area:
-                    output_image[labels == i] = 255
-            processed_image = output_image
-            operations.append("去除小连通域")
-            logger.debug("DEBUG: 执行高强度预处理 - 去除小连通域。")
-            
-            return processed_image, operations
+            return final_image, operations
             
         except Exception as e:
-            logger.error(f"高强度文本预处理失败: {e}\n{traceback.format_exc()}")
-            operations.append("预处理异常")
-            return gray_image, operations # 失败则返回原灰度图像
-    
-    def _moderate_text_preprocessing(self, gray_image: np.ndarray, **options) -> Tuple[np.ndarray, List[str]]:
-        """
-        中等强度文本预处理，适用于质量一般但有轻微缺陷的图像。
-        包含双边滤波、CLAHE、对比度增强和自适应二值化。
-        """
-        operations = []
-        
-        try:
-            processed_image = gray_image.copy()
-            
-            # 双边滤波 (轻度去噪，保留边缘)
-            d_val = options.get('bilateral_d', 9)
-            sigma_color = options.get('bilateral_sigma_color', 75.0)
-            sigma_space = options.get('bilateral_sigma_space', 75.0)
-            processed_image = cv2.bilateralFilter(processed_image, d_val, int(sigma_color), int(sigma_space))
-            operations.append("双边滤波去噪")
-            
-            # CLAHE直方图均衡化
-            clahe_clip_limit = options.get('clahe_clip_limit', 2.0)
-            clahe_tile_grid_size = options.get('clahe_tile_grid_size', (8, 8))
-            clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_tile_grid_size)
-            processed_image = clahe.apply(processed_image)
-            operations.append("CLAHE直方图均衡化")
-            
-            # 对比度增强 (线性变换)
-            alpha = 1.3  # 对比度控制
-            beta = 10    # 亮度控制
-            processed_image = cv2.convertScaleAbs(processed_image, alpha=alpha, beta=beta)
-            operations.append(f"对比度增强 (α={alpha}, β={beta})")
-            
-            # 锐化 (中等强度)
-            kernel_sharpen = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-            processed_image = cv2.filter2D(processed_image, -1, kernel_sharpen)
-            operations.append("锐化处理")
-            
-            # 自适应二值化
-            block_size = options.get('adaptive_block_size', 11)
-            C_value = options.get('adaptive_c_constant', 2)
-            if block_size % 2 == 0:
-                block_size += 1
-            processed_image = cv2.adaptiveThreshold(processed_image, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                                    cv2.THRESH_BINARY, block_size, C_value)
-            operations.append("自适应二值化")
-            
-            # 轻度形态学处理 (闭运算连接文本，开运算去除噪点)
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            processed_image = cv2.morphologyEx(processed_image, cv2.MORPH_CLOSE, kernel)
-            processed_image = cv2.morphologyEx(processed_image, cv2.MORPH_OPEN, kernel)
-            operations.append("轻度形态学处理")
-            
-            return processed_image, operations
-            
-        except Exception as e:
-            logger.error(f"中等强度文本预处理失败: {e}\n{traceback.format_exc()}")
-            operations.append("预处理异常")
-            return gray_image, operations
-    
-    def _light_text_preprocessing(self, gray_image: np.ndarray, **options) -> Tuple[np.ndarray, List[str]]:
-        """
-        轻度文本预处理，适用于质量较好，只有轻微缺陷的图像。
-        包含轻微对比度调整和OTSU二值化。
-        """
-        operations = []
-        
-        try:
-            processed_image = gray_image.copy()
-            
-            # 轻微对比度调整
-            alpha = 1.15  # 轻微的对比度增强
-            beta = 5      # 轻微的亮度调整
-            processed_image = cv2.convertScaleAbs(processed_image, alpha=alpha, beta=beta)
-            operations.append(f"轻微对比度调整 (α={alpha}, β={beta})")
-            
-            # 轻度锐化
-            kernel_sharpen = np.array([[0, -0.5, 0], [-0.5, 3, -0.5], [0, -0.5, 0]])
-            processed_image = cv2.filter2D(processed_image, -1, kernel_sharpen)
-            operations.append("轻度锐化")
-
-            # OTSU二值化 (对良好图像通常足够，自动确定阈值)
-            _, processed_image = cv2.threshold(processed_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            operations.append("OTSU二值化")
-            
-            return processed_image, operations
-            
-        except Exception as e:
-            logger.error(f"轻度文本预处理失败: {e}\n{traceback.format_exc()}")
-            operations.append("预处理异常")
-            return gray_image, operations
-    
-    def _minimal_text_preprocessing(self, gray_image: np.ndarray, **options) -> Tuple[np.ndarray, List[str]]:
-        """
-        最小文本预处理，适用于质量优秀，几乎没有缺陷的图像。
-        只进行极轻微锐化和OTSU二值化。
-        """
-        operations = []
-        
-        try:
-            processed_image = gray_image.copy()
-            
-            # 极轻微锐化 (避免对高质量图像过度处理)
-            kernel_sharpen = np.array([[0, -0.1, 0], [-0.1, 1.4, -0.1], [0, -0.1, 0]])
-            processed_image = cv2.filter2D(processed_image, -1, kernel_sharpen)
-            operations.append("极轻度锐化")
-
-            # OTSU二值化 (保持简洁高效)
-            _, processed_image = cv2.threshold(processed_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            operations.append("OTSU二值化")
-            
-            return processed_image, operations
-            
-        except Exception as e:
-            logger.error(f"最小文本预处理失败: {e}\n{traceback.format_exc()}")
-            operations.append("预处理异常")
-            return gray_image, operations
-    
+            logger.error(f"手动控制预处理失败: {e}\n{traceback.format_exc()}")
+            # 发生异常时，安全地返回原始图像的BGR版本
+            if len(image.shape) == 2:
+                return cv2.cvtColor(image, cv2.COLOR_BGR2BGR), ['错误: 预处理异常']
+            return image, ['错误: 预处理异常']
     def _optimize_image_size(self, image: np.ndarray) -> np.ndarray:
         """
         基础尺寸优化，确保图像在OCR友好的尺寸范围内（1000-1600像素的最长边）。
@@ -3483,102 +4030,94 @@ class AdvancedTextImageProcessor:
         except Exception as e:
             logger.error(f"清理缓存失败: {e}")
 class EnhancedCVOCRManager:
-    """增强版CVOCR引擎管理器 - 集成多个先进OCR技术 (专业版)"""
+    """
+    增强版CVOCR引擎管理器 (V3.29 - 终极技术栈升级版)
+    - 彻底移除已被淘汰的FSRCNN模块。
+    - 集成DBNet++作为默认的SOTA文本检测器。
+    - 聚焦于DBNet++ + LayoutLMv2 + TrOCR + GPT-Neo + Tesseract的现代技术栈。
+    """
 
-    def __init__(self):
-        # 模型和处理器占位符
+    def __init__(self, logger_func: Callable):
+        """
+        增强版CVOCR引擎管理器的构造函数 (V3.32 - 延迟初始化版)。
+        - 初始化所有模型占位符、配置和状态变量。
+        - 接受来自GUI的日志函数。
+        - 将 UnifiedObjectDetector 的实例化推迟到 initialize 方法中，以便使用用户配置。
+        
+        Args:
+            logger_func (Callable): 一个用于记录日志并显示在GUI上的函数。
+        """
+        # ======================================================================
+        # 1. 模型和处理器占位符
+        # ======================================================================
         self.layoutlm_processor = None
         self.layoutlm_model = None
         self.trocr_processor = None
         self.trocr_model = None
         self.gpt_neo_tokenizer = None
         self.gpt_neo_model = None
+        self.fsrcnn_model = None # 保留占位符
         
-        # FSRCNN 暂时保持模拟，因为它通常需要独立的模型文件。
-        self.fsrcnn_model = {
-            'type': 'fsrcnn_enhanced',
-            'scale_factor': 2,
-            'initialized': True,
-            'model_path': None, # 实际应用中应该是模型文件路径
-            'input_size': (None, None), # 支持任意尺寸输入
-            'performance': {
-                'avg_processing_time': 0.0,
-                'processed_count': 0
-            }
-        }
+        # ### 修正：将检测器初始化为 None，推迟实例化 ###
+        self.text_detector = None
+        self.unified_detector = None
         
-        # Tesseract 相关
+        # ======================================================================
+        # 2. Tesseract 相关设置
+        # ======================================================================
         self.tesseract_config = None
         self.tesseract_path = None
         
-        # 状态与配置
+        # ======================================================================
+        # 3. 状态与配置
+        # ======================================================================
         self.is_initialized = False
-        self.device = "cpu" # 默认设备
+        self.device = "cpu"
         self.version_info = {}
-        self.precision_level = OCRPrecisionLevel.BALANCED
         self.language = OCRLanguage.AUTO
         
-        # CVOCRManager 内部的配置字典，用于存储来自 GUI 的最新设置
+        self.logger_func = logger_func
+
+        # 内部默认配置字典，将被UI设置覆盖
         self.config = {
             'psm': 6, 'oem': 3,
             'confidence_threshold': CVOCRConstants.DEFAULT_CONFIDENCE_THRESHOLD,
             'lang': 'chi_sim+eng',
             'enable_layout_analysis': False,
             'enable_context_analysis': False,
-            'enable_super_resolution': False,
             'enable_transformer_ocr': False,
             'dpi': CVOCRConstants.DEFAULT_DPI,
             'enable_preprocessing_optimization': True,
             'batch_size': 1,
             'use_gpu': False,
             'model_precision': 'fp32',
-            'tesseract_process_timeout': 300, # 新增或修改此行，设置为300秒 (5分钟)
-            # 预处理相关配置 (初始默认值，这些值会被GUI的设置覆盖)
-            'enable_deskew': True,
-            'deskew_angle_threshold': 0.5,
-            'remove_borders': True,
-            'border_threshold': 10,
-            'crop_to_content': True,
-            'page_border_detection': True,
-            'shadow_removal': True,
-            'denoise_strength': 0.1,
-            'edge_preservation': 0.8,
-            'unsharp_mask': True,
-            'unsharp_radius': 1.0,
-            'unsharp_amount': 1.0,
-            'histogram_equalization': True,
-            'bilateral_filter': True,
-            'bilateral_d': 9,
-            'bilateral_sigma_color': 75.0,
-            'bilateral_sigma_space': 75.0,
-            'apply_clahe': True,
-            'clahe_clip_limit': 2.0,
-            'clahe_tile_grid_size': (8, 8),
-            'adaptive_block_size': 11,
-            'adaptive_c_constant': 2,
-            'force_intensive_preprocessing': False, # 用于控制是否强制高强度预处理
+            'tesseract_process_timeout': 300,
+            'force_intensive_preprocessing': False,
+            'ppocr_model_name': 'text_detection_cn_ppocrv3_2023may.onnx',
+            # 新增YOLO路径的默认值
+            'yolo_weights_path': 'yolov4-tiny.weights',
+            'yolo_cfg_path': 'yolov4-tiny.cfg',
+            'yolo_names_path': 'coco.names'
         }
-        self.text_detector = EnhancedTextDetector() # 实例化分割器
-        # 性能监控
+        
+        # ======================================================================
+        # 4. 性能监控
+        # ======================================================================
         self.performance_stats = {
             'total_recognitions': 0,
             'successful_recognitions': 0,
             'failed_recognitions': 0,
             'average_recognition_time': 0.0,
             'recognition_times': deque(maxlen=100),
-            'component_usage': defaultdict(int) # 使用defaultdict方便统计
+            'component_usage': defaultdict(int)
         }
         
-        logger.info("增强版CVOCR引擎管理器已创建 (专业版)")
-
+        logger.info("增强版CVOCR引擎管理器已创建 (等待初始化...)")
     @staticmethod
     def _execute_tesseract_subprocess(image_pil: Image.Image, tesseract_cmd_path: Optional[str], config_str: str, timeout: int) -> Dict:
         """
-        Tesseract子进程执行器 (V3.6 延长超时时间版)
-        - 增加日志密度，追踪执行流
-        - 增强错误捕获和诊断信息
-        - 确保临时文件清理
-        - 恢复使用可配置的timeout，并建议提高默认值
+        Tesseract子进程执行器 (V3.7 - 配置文件模式修正版)
+        - 使用临时配置文件传递参数，解决中文识别参数失效问题。
         """
         import subprocess
         import io
@@ -3593,18 +4132,17 @@ class EnhancedCVOCRManager:
         tesseract_executable = tesseract_cmd_path if (tesseract_cmd_path and os.path.exists(tesseract_cmd_path)) else "tesseract"
         logger.debug(f"DEBUG: 确认Tesseract可执行文件路径: {tesseract_executable}")
         
-        # 在执行前再次验证 tesseract_executable 是否可执行
         if not shutil.which(tesseract_executable) and not os.path.exists(tesseract_executable):
             logger.error(f"ERROR: Tesseract可执行文件未找到或不可执行: '{tesseract_executable}'。请检查路径配置。", exc_info=True)
             return {"status": "error", "message": f"Tesseract 可执行文件未找到或不可执行: '{tesseract_executable}'。"}
 
         temp_image_path = None
         temp_output_base = None
+        temp_config_path = None
         temp_output_txt = None
         temp_output_tsv = None
 
         try:
-            # 图像数据准备
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as temp_image_file:
                 temp_image_path = temp_image_file.name
                 if image_pil.mode not in ['RGB', 'L']:
@@ -3612,16 +4150,57 @@ class EnhancedCVOCRManager:
                 image_pil.save(temp_image_path, format='PNG')
             logger.debug(f"DEBUG: 图像已成功保存到临时文件: {temp_image_path} 用于Tesseract输入。")
 
-            # 构造 Tesseract 输出的临时文件路径
             temp_output_base = tempfile.NamedTemporaryFile(delete=False).name
             temp_output_txt = temp_output_base + '.txt'
             temp_output_tsv = temp_output_base + '.tsv'
 
-            config_args = config_str.split()
-
-            command_base_txt = [tesseract_executable, temp_image_path, temp_output_base] + config_args
-            command_base_tsv = [tesseract_executable, temp_image_path, temp_output_base, 'tsv'] + config_args
+            config_to_use = ""
+            if isinstance(config_str, list) and len(config_str) > 0:
+                config_to_use = config_str[0][0]
+            elif isinstance(config_str, str):
+                config_to_use = config_str
             
+            # 【核心修正】: 将配置写入临时文件
+            config_parts = config_to_use.split()
+            
+            # 分离出 --psm, --oem, -l 这些主参数
+            command_args = []
+            # 将 -c 参数的内容写入配置文件
+            config_file_lines = []
+
+            i = 0
+            while i < len(config_parts):
+                part = config_parts[i]
+                if part in ['--psm', '--oem', '-l']:
+                    command_args.append(part)
+                    if i + 1 < len(config_parts):
+                        command_args.append(config_parts[i+1])
+                        i += 1
+                elif part == '-c':
+                    if i + 1 < len(config_parts):
+                        # 将 key=value 写入配置文件, Tesseract配置文件格式是 "key value"
+                        config_file_lines.append(config_parts[i+1].replace('=', ' ', 1))
+                        i += 1
+                i += 1
+            
+            # 构建基础命令
+            command_base = [tesseract_executable, temp_image_path, temp_output_base] + command_args
+
+            # 如果有需要写入配置文件的参数
+            if config_file_lines:
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False, suffix='.cfg', encoding='utf-8') as temp_config_file:
+                    temp_config_path = temp_config_file.name
+                    temp_config_file.write('\n'.join(config_file_lines))
+                # 将配置文件名作为最后一个参数添加到命令中
+                command_base.append(os.path.basename(temp_config_path).split('.')[0])
+                logger.debug(f"DEBUG: Tesseract 配置已写入临时文件: {temp_config_path}")
+            
+            command_txt = command_base
+            command_tsv = command_base + ['tsv']
+            
+            logger.debug(f"DEBUG: 最终执行的 Txt 命令: {' '.join(command_txt)}")
+            logger.debug(f"DEBUG: 最终执行的 Tsv 命令: {' '.join(command_tsv)}")
+
             creation_flags = 0
             if platform.system() == "Windows":
                 try:
@@ -3630,37 +4209,25 @@ class EnhancedCVOCRManager:
                     creation_flags = 0x08000000
 
             try:
-                # 恢复使用传入的 timeout 参数
                 actual_timeout = timeout 
                 logger.debug(f"DEBUG: Tesseract进程超时设置为: {actual_timeout} 秒。")
+                
+                # 在包含配置文件的目录中执行命令，以确保Tesseract能找到它
+                process_cwd = os.path.dirname(temp_config_path) if temp_config_path else None
 
-                # 1. 获取纯文本结果
-                logger.debug(f"DEBUG: 将调用 subprocess.run 执行纯文本命令: {' '.join(command_base_txt)}")
                 process_text = subprocess.run(
-                    command_base_txt,
-                    capture_output=True,
-                    timeout=actual_timeout,
-                    creationflags=creation_flags,
-                    check=False
+                    command_txt, capture_output=True, timeout=actual_timeout,
+                    creationflags=creation_flags, check=False, cwd=process_cwd
                 )
-                logger.debug(f"DEBUG: subprocess.run (纯文本) 执行完成，返回码: {process_text.returncode}")
-
                 if process_text.returncode != 0:
                     stderr_msg = process_text.stderr.decode('utf-8', 'ignore').strip()
                     logger.error(f"ERROR: Tesseract纯文本命令执行失败，返回码: {process_text.returncode}, 错误输出: {stderr_msg}", exc_info=True)
                     return {"status": "error", "message": f"Tesseract纯文本命令执行失败，返回码: {process_text.returncode}，错误输出: {stderr_msg}"}
 
-                # 2. 获取详细数据 (TSV格式)
-                logger.debug(f"DEBUG: 将调用 subprocess.run 执行TSV命令: {' '.join(command_base_tsv)}")
                 process_data = subprocess.run(
-                    command_base_tsv,
-                    capture_output=True,
-                    timeout=actual_timeout,
-                    creationflags=creation_flags,
-                    check=False
+                    command_tsv, capture_output=True, timeout=actual_timeout,
+                    creationflags=creation_flags, check=False, cwd=process_cwd
                 )
-                logger.debug(f"DEBUG: subprocess.run (TSV) 执行完成，返回码: {process_data.returncode}")
-
                 if process_data.returncode != 0:
                     stderr_msg = process_data.stderr.decode('utf-8', 'ignore').strip()
                     logger.error(f"ERROR: Tesseract TSV命令执行失败，返回码: {process_data.returncode}, 错误输出: {stderr_msg}", exc_info=True)
@@ -3676,25 +4243,16 @@ class EnhancedCVOCRManager:
                 logger.error(f"ERROR: 执行Tesseract命令时发生未知错误: {str(e)}", exc_info=True)
                 return {"status": "error", "message": f"执行Tesseract命令时发生未知错误: {str(e)}"}
 
-            # 3. 读取结果文件
             full_text = ""
             data_lines = []
             try:
                 if os.path.exists(temp_output_txt):
                     with open(temp_output_txt, 'r', encoding='utf-8') as f:
                         full_text = f.read()
-                    logger.debug(f"DEBUG: 已读取纯文本文件: {temp_output_txt}")
-                else:
-                    logger.warning(f"WARNING: Tesseract纯文本输出文件未找到: {temp_output_txt}")
-
                 if os.path.exists(temp_output_tsv):
                     with open(temp_output_tsv, 'r', encoding='utf-8') as f:
                         data_lines = f.read().strip().split('\n')
-                    logger.debug(f"DEBUG: 已读取TSV文件: {temp_output_tsv}")
-                else:
-                    logger.warning(f"WARNING: Tesseract TSV输出文件未找到: {temp_output_tsv}")
 
-                # 4. 解析结果
                 data_dict = defaultdict(list)
                 if len(data_lines) > 1:
                     header = data_lines[0].split('\t')
@@ -3706,11 +4264,10 @@ class EnhancedCVOCRManager:
                 
                 for key in ['level', 'page_num', 'block_num', 'par_num', 'line_num', 'word_num', 'left', 'top', 'width', 'height']:
                     if key in data_dict:
-                        data_dict[key] = [int(v) for v in data_dict[key]]
+                        data_dict[key] = [int(v) for v in data_dict[key] if v.isdigit()]
                 if 'conf' in data_dict:
                     data_dict['conf'] = [float(v) for v in data_dict['conf'] if v != '-1']
 
-                logger.debug("DEBUG: Tesseract结果解析完成。")
                 return {"status": "success", "data": dict(data_dict), "full_text": full_text}
                 
             except Exception as e:
@@ -3721,29 +4278,12 @@ class EnhancedCVOCRManager:
             logger.error(f"ERROR: _execute_tesseract_subprocess 外部主块发生意外错误: {str(e)}", exc_info=True)
             return {"status": "error", "message": f"Tesseract执行过程中出现意外错误: {str(e)}", "traceback": traceback.format_exc()}
         finally:
-            # 确保清理临时文件
-            if temp_image_path and os.path.exists(temp_image_path):
-                try:
-                    os.remove(temp_image_path)
-                    logger.debug(f"DEBUG: 已清理临时图像文件: {temp_image_path}")
-                except Exception as e:
-                    logger.warning(f"WARNING: 无法清理临时图像文件 {temp_image_path}: {e}")
-            if temp_output_base: # 检查基础路径是否存在
-                if os.path.exists(temp_output_txt):
+            for path in [temp_image_path, temp_output_txt, temp_output_tsv, temp_config_path]:
+                if path and os.path.exists(path):
                     try:
-                        os.remove(temp_output_txt)
-                        logger.debug(f"DEBUG: 已清理临时纯文本文件: {temp_output_txt}")
+                        os.remove(path)
                     except Exception as e:
-                        logger.warning(f"WARNING: 无法清理临时纯文本文件 {temp_output_txt}: {e}")
-                if os.path.exists(temp_output_tsv):
-                    try:
-                        os.remove(temp_output_tsv)
-                        logger.debug(f"DEBUG: 已清理临时TSV文件: {temp_output_tsv}")
-                    except Exception as e:
-                        logger.warning(f"WARNING: 无法清理临时TSV文件 {temp_output_tsv}: {e}")
-    
-    
-    
+                        logger.warning(f"WARNING: 无法清理临时文件 {path}: {e}")
     def set_tesseract_path(self, path: str):
         """设置Tesseract的可执行文件路径并验证"""
         try:
@@ -3761,27 +4301,53 @@ class EnhancedCVOCRManager:
             return False, f"设置路径时出错: {e}"
 
     def initialize(self, language: OCRLanguage = OCRLanguage.AUTO, 
-                   precision_level: OCRPrecisionLevel = OCRPrecisionLevel.BALANCED,
-                   use_gpu: bool = False, **kwargs) -> Tuple[bool, str]:
-        """初始化CVOCR模型 (专业版实现)"""
+               use_gpu: bool = False, **kwargs) -> Tuple[bool, str]:
+        """
+        初始化CVOCR模型 (V4.3 - 检测器逻辑修正版)。
+        - 实例化 EnhancedTextDetector 作为支持自定义算法组合的主文本检测器。
+        - PPOCRv3 模型仍然会按需加载，但主检测逻辑由 EnhancedTextDetector 驱动。
+        """
+        # ### 关键修正：在方法最开始就处理Tesseract路径 ###
+        tesseract_path_from_config = self.config.get('tesseract_path')
+        if tesseract_path_from_config:
+            success, msg = self.set_tesseract_path(tesseract_path_from_config)
+            if not success:
+                self.logger_func(f"⚠️ 配置文件中的Tesseract路径无效: {tesseract_path_from_config}. {msg}", "WARNING")
+        
         try:
-            import pytesseract # 确保在最前面导入，以便设置Tesseract路径
-            # 确保在这里再次应用 Tesseract 路径，如果已设置
-            if self.tesseract_path and os.path.exists(self.tesseract_path) and shutil.which(self.tesseract_path):
-                pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
-                logger.info(f"初始化时应用已配置的Tesseract路径: {self.tesseract_path}")
-            else:
-                logger.warning("⚠️ Tesseract路径未配置或无效，将尝试使用系统PATH中的Tesseract。")
-
+            import pytesseract
         except ImportError:
-            return False, "pytesseract未安装，请先安装"
-        except Exception as e:
-            logger.warning(f"应用Tesseract路径时出错: {e}")
-
+            return False, "pytesseract未安装，请先安装: pip install pytesseract"
+        
         if self.is_initialized:
             logger.info("CVOCR引擎已初始化，无需重复。")
             return True, "CVOCR引擎已初始化"
 
+        # --- 核心逻辑修正：实例化 EnhancedTextDetector 作为主检测器 ---
+        # 这将使GUI中的高级分割技术选项能够正常工作。
+        try:
+            self.text_detector = EnhancedTextDetector()
+            logger.info("✅ 成功初始化支持自定义算法组合的 EnhancedTextDetector。")
+        except Exception as e:
+            logger.error(f"❌ 初始化 EnhancedTextDetector 失败: {e}", exc_info=True)
+            return False, f"初始化 EnhancedTextDetector 失败: {e}"
+        
+
+        # 根据配置创建全元素检测器 (YOLO)
+        try:
+            self.unified_detector = UnifiedObjectDetector(
+                logger_func=self.logger_func,
+                cfg_path=self.config.get('yolo_cfg_path', 'yolov4-tiny.cfg'),
+                weights_path=self.config.get('yolo_weights_path', 'yolov4-tiny.weights'),
+                names_path=self.config.get('yolo_names_path', 'coco.names')
+            )
+            if self.unified_detector.net is None:
+                self.unified_detector = None
+        except Exception as e:
+            self.unified_detector = None
+            self.logger_func(f"❌ 初始化YOLO检测器时发生错误: {e}", "ERROR")
+
+        # 检查AI库依赖
         try:
             import torch
             from transformers import (
@@ -3789,14 +4355,10 @@ class EnhancedCVOCRManager:
                 TrOCRProcessor, VisionEncoderDecoderModel,
                 GPT2Tokenizer, GPTNeoForCausalLM
             )
-            import cv2 # 确保OpenCV也可用
         except ImportError as e:
-            logger.error(f"❌ 初始化失败：缺少必要的AI/图像处理库: {e}。请运行 'pip install torch transformers sentencepiece opencv-python'", exc_info=True)
-            return False, f"初始化失败：缺少必要的AI/图像处理库: {e}。请运行 'pip install torch transformers sentencepiece opencv-python'"
-        except Exception as e:
-            logger.error(f"❌ AI/图像处理库导入异常: {e}\n{traceback.format_exc()}", exc_info=True)
-            return False, f"AI/图像处理库导入异常: {e}"
-
+            logger.error(f"❌ 初始化失败：缺少必要的AI/图像处理库: {e}。", exc_info=True)
+            return False, f"初始化失败：缺少必要的AI/图像处理库: {e}。请运行 'pip install torch transformers sentencepiece'"
+        
         start_init_time = time.time()
         
         if use_gpu and torch.cuda.is_available():
@@ -3809,51 +4371,45 @@ class EnhancedCVOCRManager:
             else:
                 logger.info("ℹ️ 将使用CPU进行计算。")
 
-        self.precision_level = precision_level
         self.language = language
         
-        logger.info(f"开始初始化CVOCR引擎 (语言: {language.value}, 精度: {precision_level.value}, 设备: {self.device})")
+        logger.info(f"开始初始化CVOCR引擎 (语言: {language.value}, 精度: custom, 设备: {self.device})")
         
-        # 2. 初始化Tesseract (增加语言包检查)
         success, message = self._initialize_tesseract()
         if not success:
             return False, message
 
-        # 3. 按需加载高级模型 (现在是真正的加载，并更明确地记录状态)
+        # 加载高级AI模型
         try:
-            # LayoutLMv2
+            logger.info("ℹ️ FSRCNN功能已被移除，跳过加载。")
+            
             if self.config.get('enable_layout_analysis', False):
-                logger.debug("DEBUG: 尝试加载LayoutLMv2模型...")
                 try:
                     self.layoutlm_processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
                     self.layoutlm_model = LayoutLMv2ForTokenClassification.from_pretrained("microsoft/layoutlmv2-base-uncased").to(self.device)
                     self.layoutlm_model.eval()
                     logger.info("✅ LayoutLMv2模型加载成功。")
                 except Exception as e:
-                    self.layoutlm_model = None
-                    self.layoutlm_processor = None
-                    logger.error(f"❌ LayoutLMv2模型加载失败: {e}\n{traceback.format_exc()}", exc_info=True)
+                    self.layoutlm_model, self.layoutlm_processor = None, None
+                    logger.error(f"❌ LayoutLMv2模型加载失败: {e}", exc_info=True)
             else:
                 logger.info("ℹ️ LayoutLMv2未启用，跳过加载。")
 
-            # TrOCR
             if self.config.get('enable_transformer_ocr', False):
-                logger.debug("DEBUG: 尝试加载TrOCR模型...")
                 try:
-                    self.trocr_processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-handwritten')
-                    self.trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-handwritten').to(self.device)
+                    model_name = self.config.get('transformer_ocr_model', 'microsoft/trocr-base-printed')
+                    logger.info(f"正在加载指定的TrOCR模型: {model_name}")
+                    self.trocr_processor = TrOCRProcessor.from_pretrained(model_name, use_fast=True)
+                    self.trocr_model = VisionEncoderDecoderModel.from_pretrained(model_name, ignore_mismatched_sizes=True).to(self.device)
                     self.trocr_model.eval()
-                    logger.info("✅ TrOCR模型加载成功。")
+                    logger.info(f"✅ TrOCR模型 ({model_name}) 加载成功。")
                 except Exception as e:
-                    self.trocr_model = None
-                    self.trocr_processor = None
-                    logger.error(f"❌ TrOCR模型加载失败: {e}\n{traceback.format_exc()}", exc_info=True)
+                    self.trocr_model, self.trocr_processor = None, None
+                    logger.error(f"❌ TrOCR模型加载失败: {e}", exc_info=True)
             else:
                 logger.info("ℹ️ TrOCR未启用，跳过加载。")
 
-            # GPT-Neo
             if self.config.get('enable_context_analysis', False):
-                logger.debug("DEBUG: 尝试加载GPT-Neo模型...")
                 try:
                     self.gpt_neo_tokenizer = GPT2Tokenizer.from_pretrained("EleutherAI/gpt-neo-125M")
                     self.gpt_neo_model = GPTNeoForCausalLM.from_pretrained("EleutherAI/gpt-neo-125M").to(self.device)
@@ -3861,14 +4417,13 @@ class EnhancedCVOCRManager:
                     self.gpt_neo_tokenizer.pad_token = self.gpt_neo_tokenizer.eos_token
                     logger.info("✅ GPT-Neo模型加载成功。")
                 except Exception as e:
-                    self.gpt_neo_model = None
-                    self.gpt_neo_tokenizer = None
-                    logger.error(f"❌ GPT-Neo模型加载失败: {e}\n{traceback.format_exc()}", exc_info=True)
+                    self.gpt_neo_model, self.gpt_neo_tokenizer = None, None
+                    logger.error(f"❌ GPT-Neo模型加载失败: {e}", exc_info=True)
             else:
                 logger.info("ℹ️ GPT-Neo未启用，跳过加载。")
 
         except Exception as e:
-            logger.error(f"❌ 加载高级AI模型时发生外部意外错误: {e}\n{traceback.format_exc()}", exc_info=True)
+            logger.error(f"❌ 加载高级AI模型时发生外部意外错误: {e}", exc_info=True)
             return False, f"加载高级AI模型时发生意外错误: {e}。请检查网络连接和磁盘空间。"
 
         init_time = time.time() - start_init_time
@@ -3882,14 +4437,13 @@ class EnhancedCVOCRManager:
             'opencv': CVOCRVersionManager.get_opencv_version(),
             'torch': CVOCRVersionManager.get_torch_version(),
             'language': language.value,
-            'precision_level': precision_level.value,
             'use_gpu': self.device == "cuda",
             'device': self.device,
             'init_time': init_time,
             'config': self.config.copy(),
             'components': {
                 'tesseract_enabled': True,
-                'fsrcnn_enabled': self.config.get('enable_super_resolution', False) and (self.fsrcnn_model is not None),
+                'fsrcnn_enabled': False,
                 'layoutlm_enabled': self.config.get('enable_layout_analysis', False) and (self.layoutlm_model is not None),
                 'gpt_neo_enabled': self.config.get('enable_context_analysis', False) and (self.gpt_neo_model is not None),
                 'transformer_ocr_enabled': self.config.get('enable_transformer_ocr', False) and (self.trocr_model is not None)
@@ -3898,15 +4452,16 @@ class EnhancedCVOCRManager:
             'initialization_timestamp': datetime.now().isoformat()
         }
         
-        # 运行测试 (测试核心Tesseract功能)
         test_success, test_msg = self._test_ocr_engine()
         if not test_success:
             self.is_initialized = False
             return False, f"CVOCR引擎初始化成功，但Tesseract基础测试失败: {test_msg}"
         
-        success_message = f"CVOCR引擎初始化成功：语言: {language.value}, 精度: {precision_level.value}, 耗时: {init_time:.2f}秒"
+        success_message = f"CVOCR引擎初始化成功：语言: {language.value}, 精度: custom, 耗时: {init_time:.2f}秒"
         logger.info(f"{success_message}, AI设备: {self.device}")
         return True, success_message
+    
+    
     
     
     def _initialize_tesseract(self) -> Tuple[bool, str]:
@@ -3914,10 +4469,14 @@ class EnhancedCVOCRManager:
         try:
             import pytesseract
             
-            # 确认 Tesseract 可执行文件路径
-            tesseract_cmd = self.tesseract_path if self.tesseract_path and os.path.exists(self.tesseract_path) else 'tesseract'
+            # --- 关键修正：在所有操作前，优先确定并设置Tesseract可执行文件路径 ---
+            # 检查 self.tesseract_path (该路径由 initialize 方法或 set_tesseract_path 方法设置)。
+            # 如果这个路径有效存在，就将其明确地应用到 pytesseract 库的全局命令变量中。
+            # 这样，后续所有对 pytesseract 的调用（如 get_tesseract_version）都会使用这个正确的路径。
+            if self.tesseract_path and os.path.exists(self.tesseract_path):
+                pytesseract.pytesseract.tesseract_cmd = self.tesseract_path
             
-            # 获取 Tesseract 版本 (顺便检查是否能执行)
+            # 现在可以安全地调用版本检查，它会优先使用上面设置的路径
             try:
                 version = pytesseract.get_tesseract_version()
                 logger.info(f"Tesseract OCR引擎可用，版本: {version}")
@@ -3925,15 +4484,16 @@ class EnhancedCVOCRManager:
                 logger.error(f"❌ Tesseract 可执行文件无法运行或版本检测失败: {e}", exc_info=True)
                 return False, f"Tesseract 可执行文件无法运行或版本检测失败: {e}"
 
-            # 获取 Tesseract 配置字符串
-            tesseract_config_str = self._get_tesseract_config(self.precision_level, self.language)
-            self.tesseract_config = tesseract_config_str # 更新实例属性
+            # --- 修正：移除多余的参数 ---
+            # _get_tesseract_config 方法现在从 self.config 读取所有设置，
+            # 不再需要从外部传入参数。
+            tesseract_config_str = self._get_tesseract_config()
+            self.tesseract_config = tesseract_config_str
             
-            # 检查语言包是否安装
             requested_langs = self.config['lang'].split('+')
             
-            # 确保在调用subprocess.run时使用正确的tesseract_cmd
-            tesseract_executable_for_subprocess = self.tesseract_path if (self.tesseract_path and os.path.exists(self.tesseract_path)) else "tesseract"
+            # 使用 pytesseract.pytesseract.tesseract_cmd 作为唯一的真理来源，简化路径判断
+            tesseract_executable_for_subprocess = pytesseract.pytesseract.tesseract_cmd
 
             try:
                 available_langs_output = subprocess.run([tesseract_executable_for_subprocess, '--list-langs'], capture_output=True, text=True, check=True)
@@ -3941,14 +4501,12 @@ class EnhancedCVOCRManager:
                 
                 missing_langs = [lang for lang in requested_langs if lang not in available_langs]
                 
-                message = f"Tesseract初始化成功，版本: {version}" # 默认消息
+                message = f"Tesseract初始化成功，版本: {version}"
                 if missing_langs:
                     logger.warning(f"⚠️ 缺少Tesseract语言包: {', '.join(missing_langs)}。请安装。")
-                    # 尝试使用只安装的语言进行识别，如果一个都没有，则视为失败
                     if not any(lang in available_langs for lang in requested_langs):
                         return False, f"Tesseract缺少所有请求的语言包: {', '.join(requested_langs)}。请安装。"
                     else:
-                        # 至少部分语言包存在，警告但不失败
                         message += f" (警告: 缺少语言包 {', '.join(missing_langs)})"
             except FileNotFoundError:
                 logger.error(f"❌ Tesseract可执行文件 '{tesseract_executable_for_subprocess}' 未找到，无法检查语言包。", exc_info=True)
@@ -3960,89 +4518,83 @@ class EnhancedCVOCRManager:
                 logger.error(f"❌ 检查Tesseract语言包时发生意外错误: {e}", exc_info=True)
                 return False, f"检查Tesseract语言包时发生意外错误: {e}"
             
-            return True, message # 返回完整的消息
+            return True, message
                 
         except ImportError:
             logger.error("❌ pytesseract未安装，请安装: pip install pytesseract", exc_info=True)
             return False, "pytesseract未安装，请安装: pip install pytesseract"
         except Exception as e:
-            logger.error(f"❌ Tesseract初始化失败: {e}\n{traceback.format_exc()}", exc_info=True)
+            logger.error(f"❌ Tesseract初始化失败: {e}", exc_info=True)
             return False, f"Tesseract初始化失败: {str(e)}"
-    
-    def _initialize_fsrcnn_model(self):
-        """FSRCNN超分辨率模型初始化 (保持模拟，待后续专业化)"""
-        logger.info("FSRCNN超分辨率模型配置完成（演示模式）")
-    
-    def _get_tesseract_config(self, precision_level: OCRPrecisionLevel, language: OCRLanguage) -> str:
+    def _get_tesseract_config(self, lang_override: Optional[str] = None, psm_override: Optional[int] = None) -> List[Tuple[str, str]]:
         """
-        根据精度级别获取Tesseract配置 (V3.10 最终修正版)
-        - 移除了错误的字符白名单，允许Tesseract使用完整的语言模型。
-        - 保留了对中英混合场景的优化参数。
+        根据UI设置构建Tesseract配置列表 (V4.8 - 支持PSM覆盖版)。
+        返回一个配置元组列表，每个元组是 (配置字符串, 描述)。
         """
-        # 基础配置，根据精度级别选择PSM和OEM模式
-        config_map = {
-            OCRPrecisionLevel.FAST: {'psm': 7, 'oem': 3},
-            OCRPrecisionLevel.BALANCED: {'psm': 3, 'oem': 3},
-            OCRPrecisionLevel.ACCURATE: {'psm': 3, 'oem': 1}, # 精确模式使用纯LSTM引擎，更稳定
-            OCRPrecisionLevel.ULTRA: {'psm': 1, 'oem': 1},   # 超精确模式也使用纯LSTM
+        # --- PSM (页面分割模式) ---
+        if psm_override is not None:
+            psm_val = str(psm_override)
+        else:
+            psm_value_from_config = self.config.get('psm', '6')
+            if isinstance(psm_value_from_config, str):
+                psm_val = psm_value_from_config.split(':')[0].strip()
+            else:
+                psm_val = str(psm_value_from_config)
+
+        # --- OEM (引擎模式) ---
+        selected_oems = self.config.get('oem_options', {'3': True})
+        enabled_oem_keys = [key for key, enabled in selected_oems.items() if enabled]
+        
+        oem_defs = {
+            '0': "经典引擎", '1': "神经网络(LSTM)", 
+            '2': "经典+LSTM", '3': "默认(推荐LSTM)"
         }
         
-        config_settings = config_map.get(precision_level, config_map[OCRPrecisionLevel.BALANCED])
-        
-        # 优先使用GUI界面上用户手动设置的PSM
-        psm_val = self.config.get('psm', config_settings['psm'])
-        oem_val = config_settings['oem']
+        # 语言
+        lang_code = lang_override if lang_override else self.config.get('lang', 'chi_sim+eng')
 
-        # 确定语言代码
-        lang_code = self.config.get('lang', 'chi_sim+eng')
-
-        # --- 核心修正：移除错误的tessedit_char_whitelist ---
+        # 【关键】基础额外配置（包含中文优化）
         extra_configs = []
         if 'chi_sim' in lang_code or 'chi_tra' in lang_code:
-            # 这些参数有助于改善中文或中英混合识别
             extra_configs.extend([
                 '-c textord_tabfind_find_tables=1',
                 '-c chopper_enable=0',
                 '-c preserve_interword_spaces=1',
                 '-c language_model_penalty_non_freq_dict_word=0.1',
                 '-c language_model_penalty_non_dict_word=0.15',
-                # 此处不再有 tessedit_char_whitelist
             ])
+        extra_config_str = ' '.join(extra_configs)
         
-        # 构建最终的配置字符串
-        config_str = f'--psm {psm_val} --oem {oem_val} -l {lang_code}'
+        configs_to_run = []
+
+        if not enabled_oem_keys:
+            desc = f"运行: PSM={psm_val}, OEM=Tesseract默认"
+            config_str = f'--psm {psm_val} -l {lang_code} {extra_config_str}'
+            configs_to_run.append((config_str.strip(), desc))
+        else:
+            for oem_key in enabled_oem_keys:
+                desc = f"运行: PSM={psm_val}, OEM={oem_key} ({oem_defs[oem_key]})"
+                config_str = f'--psm {psm_val} --oem {oem_key} -l {lang_code} {extra_config_str}'
+                configs_to_run.append((config_str.strip(), desc))
         
-        if extra_configs:
-            config_str += ' ' + ' '.join(extra_configs)
-        
-        # 更新实例内部的config，确保一致性
-        self.config['psm'] = psm_val
-        self.config['oem'] = oem_val
+        # self.config的更新保持不变
+        self.config['psm_val'] = psm_val
         self.config['lang'] = lang_code
         
-        logger.info(f"Tesseract配置已更新: {config_str}")
-        
-        return config_str
-   
+        return configs_to_run
+    
+    
     def _test_ocr_engine(self) -> Tuple[bool, str]:
         """测试OCR引擎 (仅测试Tesseract基础功能)"""
         try:
-            import pytesseract
-            
             test_img = np.ones((100, 400, 3), dtype=np.uint8) * 255
             cv2.putText(test_img, 'CVOCR Test 2025', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
-            
-            # 使用 Image.fromarray 确保图像格式正确
             test_pil_img = Image.fromarray(cv2.cvtColor(test_img, cv2.COLOR_BGR2RGB))
-
-            # 调用 _execute_tesseract_subprocess 确保测试与实际识别流程一致
+            
             tesseract_result = self._execute_tesseract_subprocess(
-                image_pil=test_pil_img,
-                tesseract_cmd_path=self.tesseract_path,
-                config_str=self.tesseract_config,
-                timeout=self.config.get('tesseract_process_timeout', 300)
+                image_pil=test_pil_img, tesseract_cmd_path=self.tesseract_path,
+                config_str=self.tesseract_config, timeout=self.config.get('tesseract_process_timeout', 300)
             )
-
             if tesseract_result['status'] == 'error':
                 logger.error(f"OCR引擎测试失败 (Tesseract子进程错误): {tesseract_result['message']}")
                 return False, f"OCR引擎测试失败: {tesseract_result['message']}"
@@ -4052,111 +4604,191 @@ class EnhancedCVOCRManager:
             if any(word in result.upper() for word in ['CVOCR', 'TEST', '2025']):
                 return True, f"OCR引擎测试通过，识别结果: {result.strip()}"
             else:
-                return True, f"OCR引擎可用，测试结果: {result.strip()}" # 即使没完全识别对，只要能运行也算可用
+                return True, f"OCR引擎可用，测试结果: {result.strip()}"
                 
         except Exception as e:
-            logger.error(f"OCR引擎测试失败: {e}\n{traceback.format_exc()}")
+            logger.error(f"OCR引擎测试失败: {e}", exc_info=True)
             return False, f"OCR引擎测试异常: {str(e)}"
-    def _run_segmentation_and_recognize(self, image_np: np.ndarray, precision_level: OCRPrecisionLevel, scale_factors: Tuple[float, float]) -> Tuple[Dict, str]:
+    
+    def _run_segmentation_and_recognize(self, image_np: np.ndarray, scale_factors: Tuple[float, float], regions: List[np.ndarray]) -> Tuple[Dict, str]:
         """
-        执行高级分割并对每个区域进行识别 (V3.15 坐标系统一最终版)
-        - 接收原始尺寸到当前尺寸的缩放比例。
-        - 将所有识别出的局部坐标，反向缩放回原始坐标系。
+        【增强版】对每个已检测区域进行识别 (V4.9 - 中文识别修正版)
+        - 调用增强的配置生成函数，确保在使用高级分割时，为Tesseract传入正确的PSM模式和所有必需的中文优化参数。
+        - 修复了在高级分割流程中无法正确识别中文的问题。
+        - 保持了对TransformerOCR作为区域识别引擎的支持。
+        - 保持了已修复的、宏观准确的坐标系关联逻辑。
         """
-        logger.info(f"🚀 开始执行高级分割流程... 缩放比例: x={scale_factors[0]:.2f}, y={scale_factors[1]:.2f}")
-        self.performance_stats['component_usage']['advanced_segmentation'] += 1
-        image_for_detection = image_np.copy()
-        if len(image_for_detection.shape) == 2:
-             image_for_detection = cv2.cvtColor(image_for_detection, cv2.COLOR_GRAY2BGR)
-        normal_regions, _ = self.text_detector.detect_text_regions_advanced(image_for_detection, precision_level)
-        inverted_image = cv2.bitwise_not(image_for_detection)
-        inverted_regions, _ = self.text_detector.detect_text_regions_advanced(inverted_image, precision_level)
-        gray_image = cv2.cvtColor(image_for_detection, cv2.COLOR_BGR2GRAY)
-        _, binarized_image = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        binarized_bgr = cv2.cvtColor(binarized_image, cv2.COLOR_GRAY2BGR)
-        binarized_regions, _ = self.text_detector.detect_text_regions_advanced(binarized_bgr, precision_level)
-        all_detected_regions = normal_regions + inverted_regions + binarized_regions
-        scores = [cv2.contourArea(region) for region in all_detected_regions]
-        indices = sorted(range(len(scores)), key=lambda k: scores[k], reverse=True)
-        final_regions = []
-        while len(indices) > 0:
-            current_index = indices.pop(0)
-            current_region = all_detected_regions[current_index]
-            final_regions.append(current_region)
-            remaining_indices = []
-            for i in indices:
-                if self._calculate_bbox_iou_for_polygons(current_region, all_detected_regions[i]) < 0.5:
-                    remaining_indices.append(i)
-            indices = remaining_indices
-        regions = final_regions
+        if not regions: 
+            logger.warning("识别流程中止：没有从上游检测器接收到任何文本区域。")
+            return {}, ""
+
+        logger.info(f"🚀 开始对 {len(regions)} 个已检测区域进行识别... 缩放比例: x={scale_factors[0]:.2f}, y={scale_factors[1]:.2f}")
         
-        if not regions: return {}, ""
+        recognizer_engine = self.config.get('segmentation_recognizer', 'Tesseract')
+        logger.info(f"将使用 '{recognizer_engine}' 引擎进行识别。")
         
         all_ocr_data = defaultdict(list)
         recognized_parts = []
         scale_x, scale_y = scale_factors
-        
-        for i, region_box in enumerate(regions):
-            try:
-                rect = cv2.minAreaRect(region_box)
-                center, size, angle = rect
-                width, height = int(size[0]), int(size[1])
-                if height > width * 1.5:
-                    angle += 90; width, height = height, width
-                M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                warped_bgr = cv2.warpAffine(image_np, M, (image_np.shape[1], image_np.shape[0]), flags=cv2.INTER_CUBIC)
-                cropped_bgr = cv2.getRectSubPix(warped_bgr, (width, height), center)
-                if cropped_bgr is None or cropped_bgr.size == 0: continue
-                gray_cropped = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2GRAY)
-                h, w = gray_cropped.shape
-                if h > 0 and (h < 24 or h > 64):
-                    scale = 40.0 / h
-                    gray_cropped = cv2.resize(gray_cropped, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
-                enhanced_contrast = clahe.apply(gray_cropped)
-                _, binarized = cv2.threshold(enhanced_contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                bordered = cv2.copyMakeBorder(binarized, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=[255])
-                processed_for_ocr = cv2.cvtColor(bordered, cv2.COLOR_GRAY2BGR)
-                cropped_pil = Image.fromarray(cv2.cvtColor(processed_for_ocr, cv2.COLOR_BGR2RGB))
-                tesseract_config_str = self._get_tesseract_config(self.precision_level, self.language)
-                psm_mode = 7 if max(cropped_bgr.shape) > 50 else 8
-                tesseract_config_str = re.sub(r'--psm \d+', f'--psm {psm_mode}', tesseract_config_str)
-                region_result = self._execute_tesseract_subprocess(
-                    image_pil=cropped_pil, tesseract_cmd_path=self.tesseract_path,
-                    config_str=tesseract_config_str, timeout=tesseract_timeout
-                )
 
-                if region_result["status"] == "success" and region_result.get("data"):
-                    box_points_original = cv2.boxPoints(rect)
-                    x_start_processed, y_start_processed = int(min(box_points_original[:, 0])), int(min(box_points_original[:, 1]))
+        if recognizer_engine == "TransformerOCR" and self.trocr_model:
+            self.performance_stats['component_usage']['transformer_ocr'] += 1
+            region_images_for_trocr = []
+            valid_region_boxes = []
+
+            for region_box in regions:
+                try:
+                    rect = cv2.minAreaRect(region_box)
+                    center, (width, height), angle = rect
+
+                    # --- 最终版智能旋转逻辑 ---
+                    if width < height:
+                        width, height = height, width
+                        swapped = True
+                    else:
+                        swapped = False
+
+                    aspect_ratio = width / height if height > 0 else 0
+                    if swapped and aspect_ratio > 1.5:
+                        angle += 90
+                    # --- 逻辑结束 ---
+
+                    if width <= 5 or height <= 5: continue
+                    width, height = int(width), int(height)
+
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    warped_bgr = cv2.warpAffine(image_np, M, (image_np.shape[1], image_np.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    cropped_bgr = cv2.getRectSubPix(warped_bgr, (width, height), center)
+                    if cropped_bgr is None or cropped_bgr.size == 0: continue
                     
-                    region_data = region_result["data"]
-                    for j in range(len(region_data.get('text', []))):
-                        abs_x_processed = region_data['left'][j] + x_start_processed
-                        abs_y_processed = region_data['top'][j] + y_start_processed
-                        width_processed = region_data['width'][j]
-                        height_processed = region_data['height'][j]
-                        
-                        all_ocr_data['left'].append(int(abs_x_processed * scale_x))
-                        all_ocr_data['top'].append(int(abs_y_processed * scale_y))
-                        all_ocr_data['width'].append(int(width_processed * scale_x))
-                        all_ocr_data['height'].append(int(height_processed * scale_y))
-                        
-                        for key in ['text', 'conf', 'word_num', 'line_num', 'par_num', 'block_num']:
-                            if key in region_data and j < len(region_data[key]):
-                                all_ocr_data[key].append(region_data[key][j])
+                    region_images_for_trocr.append(cropped_bgr)
+                    valid_region_boxes.append(region_box)
+                except Exception as e:
+                    logger.warning(f"处理区域以准备TrOCR输入时出错: {e}")
+
+            if region_images_for_trocr:
+                trocr_results = self._apply_transformer_ocr(region_images_for_trocr)
+                for i, result in enumerate(trocr_results):
+                    if result.get('error') or not result['text'].strip(): continue
                     
-                    region_text = region_result.get("full_text", "").strip()
-                    if region_text:
-                        recognized_parts.append({
-                            'text': region_text, 
-                            'y_coord': int(y_start_processed * scale_y), 
-                            'x_coord': int(x_start_processed * scale_x)
-                        })
+                    region_box = valid_region_boxes[i]
+                    x_coords, y_coords = region_box[:, 0], region_box[:, 1]
+                    x_start, y_start = int(np.min(x_coords)), int(np.min(y_coords))
+                    width, height = int(np.max(x_coords) - x_start), int(np.max(y_coords) - y_start)
+                    
+                    all_ocr_data['left'].append(int(x_start * scale_x))
+                    all_ocr_data['top'].append(int(y_start * scale_y))
+                    all_ocr_data['width'].append(int(width * scale_x))
+                    all_ocr_data['height'].append(int(height * scale_y))
+                    all_ocr_data['text'].append(result['text'])
+                    all_ocr_data['conf'].append(result['confidence'])
+                    all_ocr_data['word_num'].append(len(result['text'].split()))
+                    all_ocr_data['line_num'].append(1)
+                    all_ocr_data['par_num'].append(1)
+                    all_ocr_data['block_num'].append(i + 1)
+                    
+                    recognized_parts.append({'text': result['text'], 'y_coord': int(y_start * scale_y), 'x_coord': int(x_start * scale_x)})
+        else:
+            if recognizer_engine == "TransformerOCR":
+                logger.warning("TrOCR被选为识别引擎，但模型未加载。将自动回退到Tesseract。")
+            self.performance_stats['component_usage']['tesseract'] += 1
+            tesseract_timeout = self.config.get('tesseract_process_timeout', 300)
             
-            except Exception as e:
-                continue
-                
+            use_fine_tuning = self.config.get('enable_tesseract_fine_tuning', True)
+            if use_fine_tuning:
+                logger.info("Tesseract精细化预处理已启用。")
+            else:
+                logger.info("Tesseract精细化预处理已禁用。")
+            
+            # 【核心修正】: 调用增强的配置生成函数，并传入从GUI解析的PSM值
+            psm_str_from_gui = self.settings['psm_mode'].get()
+            psm_val = int(psm_str_from_gui.split(':')[0].strip())
+
+            # 调用中央配置函数，并覆盖PSM值，以获得包含所有优化（包括中文）的完整配置
+            configs_list = self._get_tesseract_config(psm_override=psm_val)
+            tesseract_config_for_regions = configs_list[0][0] if configs_list else ""
+            
+            # 更新日志，使其准确反映正在使用的配置
+            logger.info(f"所有区域将使用配置: '{tesseract_config_for_regions}'")
+            logger.warning(f"当前使用的PSM模式为 '{psm_str_from_gui}'。如果识别效果不佳，"
+                           f"请确保此模式适合处理已分割的独立文本块（推荐使用PSM 6, 7, 8, 13等）。")
+
+            for i, region_box in enumerate(regions):
+                try:
+                    rect = cv2.minAreaRect(region_box)
+                    center, (width, height), angle = rect
+
+                    # 智能旋转逻辑
+                    if width < height:
+                        width, height = height, width
+                        swapped = True
+                    else:
+                        swapped = False
+                    aspect_ratio = width / height if height > 0 else 0
+                    if swapped and aspect_ratio > 1.5: angle += 90
+                    
+                    if width <= 5 or height <= 5: continue
+                    width, height = int(width), int(height)
+
+                    # 切割并校正区域
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                    warped_bgr = cv2.warpAffine(image_np, M, (image_np.shape[1], image_np.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    cropped_bgr = cv2.getRectSubPix(warped_bgr, (width, height), center)
+                    if cropped_bgr is None or cropped_bgr.size == 0: continue
+                    
+                    # 应用精细化预处理（如果启用）
+                    processed_for_ocr = cropped_bgr
+                    if use_fine_tuning:
+                        gray_cropped = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2GRAY)
+                        h_proc, _ = gray_cropped.shape
+                        if h_proc > 0 and (h_proc < 24 or h_proc > 64):
+                            scale = 40.0 / h_proc
+                            gray_cropped = cv2.resize(gray_cropped, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                        enhanced = clahe.apply(gray_cropped)
+                        _, binarized = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                        bordered = cv2.copyMakeBorder(binarized, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=[255])
+                        processed_for_ocr = cv2.cvtColor(bordered, cv2.COLOR_GRAY2BGR)
+                    
+                    cropped_pil = Image.fromarray(cv2.cvtColor(processed_for_ocr, cv2.COLOR_BGR2RGB))
+                    
+                    # 调用Tesseract
+                    region_result = self._execute_tesseract_subprocess(
+                        image_pil=cropped_pil, tesseract_cmd_path=self.tesseract_path,
+                        config_str=tesseract_config_for_regions, timeout=tesseract_timeout
+                    )
+                    
+                    if region_result["status"] == "success" and region_result.get("full_text", "").strip():
+                        full_text_from_region = region_result.get("full_text", "").strip()
+                        
+                        x, y, w, h = cv2.boundingRect(region_box.astype(np.int32))
+                        
+                        confidences = region_result.get("data", {}).get("conf", [])
+                        avg_conf = sum(confidences) / len(confidences) if confidences else 95.0
+
+                        all_ocr_data['left'].append(int(x * scale_x))
+                        all_ocr_data['top'].append(int(y * scale_y))
+                        all_ocr_data['width'].append(int(w * scale_x))
+                        all_ocr_data['height'].append(int(h * scale_y))
+                        all_ocr_data['text'].append(full_text_from_region)
+                        all_ocr_data['conf'].append(avg_conf)
+                        
+                        all_ocr_data['word_num'].append(len(full_text_from_region.split()))
+                        all_ocr_data['line_num'].append(i + 1)
+                        all_ocr_data['par_num'].append(i + 1)
+                        all_ocr_data['block_num'].append(i + 1)
+                        
+                        recognized_parts.append({
+                            'text': full_text_from_region, 
+                            'y_coord': int(y * scale_y), 
+                            'x_coord': int(x * scale_x)
+                        })
+
+                except Exception as e:
+                    logger.warning(f"处理区域 {i} 时发生错误: {e}")
+                    continue
+
+        # 按阅读顺序对所有识别出的文本片段进行排序
         recognized_parts.sort(key=lambda item: (item['y_coord'], item['x_coord']))
         final_full_text = "\n".join([part['text'] for part in recognized_parts])
 
@@ -4164,190 +4796,318 @@ class EnhancedCVOCRManager:
     
     
     
-    
-    
-    # 需要在 EnhancedCVOCRManager 类中添加一个新的辅助方法来计算IoU
     def _calculate_bbox_iou_for_polygons(self, poly1, poly2) -> float:
         """计算两个多边形区域的交并比(IoU)"""
         try:
-            # 创建两个空白图像
-            img1 = np.zeros((1,1), dtype=np.uint8) # 尺寸不重要，我们会用boundingRect
-            img2 = np.zeros((1,1), dtype=np.uint8)
-
-            # 获取两个多边形的外接矩形，以确定需要的图像大小
             r1 = cv2.boundingRect(poly1.astype(int))
             r2 = cv2.boundingRect(poly2.astype(int))
             
-            # 计算一个能包含两个矩形的公共画布大小
             max_x = max(r1[0]+r1[2], r2[0]+r2[2])
             max_y = max(r1[1]+r1[3], r2[1]+r2[3])
             
             img1 = np.zeros((max_y, max_x), dtype=np.uint8)
             img2 = np.zeros((max_y, max_x), dtype=np.uint8)
 
-            # 在各自的图像上绘制填充的多边形
             cv2.fillPoly(img1, [poly1.astype(int)], 255)
             cv2.fillPoly(img2, [poly2.astype(int)], 255)
             
-            # 计算交集和并集
             intersection = np.sum(cv2.bitwise_and(img1, img2) > 0)
             union = np.sum(cv2.bitwise_or(img1, img2) > 0)
             
-            if union == 0:
-                return 0.0
-            
-            return intersection / union
+            return intersection / union if union > 0 else 0.0
         except Exception:
             return 0.0
-    def recognize_text_enhanced(self, image_path: str, enable_preprocessing: bool = True,
-                                precision_override: Optional[OCRPrecisionLevel] = None) -> Tuple[Optional[Dict], str]:
+    def _merge_blocks_by_layoutlm(self, ocr_data: Dict, layout_info: Dict) -> Dict:
         """
-        CVOCR增强文本识别的核心实现 (V3.15 坐标系统一最终版)
+        使用LayoutLMv2的分析结果，对OCR文本块进行语义合并。
+        
+        Args:
+            ocr_data (Dict): 包含多个'text_blocks'的原始OCR结果。
+            layout_info (Dict): 来自LayoutLMv2的布局分析结果。
+
+        Returns:
+            Dict: 合并后的新的OCR结果字典。
+        """
+        self.logger_func("🧠 开始执行基于LayoutLMv2的语义合并...", "INFO")
+        if not ocr_data.get('text_blocks') or not layout_info.get('text_regions'):
+            self.logger_func("⚠️ 语义合并中止：缺少OCR文本块或LayoutLMv2分析结果。", "WARNING")
+            return ocr_data
+
+        # 1. 为每个原始OCR块匹配一个LayoutLMv2的语义标签
+        ocr_blocks = ocr_data['text_blocks']
+        for block in ocr_blocks:
+            # _match_text_to_layout 会返回 {'region_type': 'Paragraph', ...}
+            block['layout_info'] = self._match_text_to_layout(block, layout_info)
+
+        # 2. 按语义标签和空间位置进行分组
+        # 我们只合并被标记为 'Paragraph', 'List', 'Table' 的块
+        mergeable_tags = {'Paragraph', 'List', 'Table', 'Section-header'}
+        
+        merged_blocks = []
+        processed_indices = set()
+        
+        # 按阅读顺序排序
+        ocr_blocks.sort(key=lambda b: (b['bbox'][1], b['bbox'][0]))
+
+        for i in range(len(ocr_blocks)):
+            if i in processed_indices:
+                continue
+
+            current_block = ocr_blocks[i]
+            current_tag = current_block.get('layout_info', {}).get('region_type', 'unknown')
+
+            # 如果当前块不可合并，或没有标签，则直接保留
+            if current_tag not in mergeable_tags:
+                merged_blocks.append(current_block)
+                processed_indices.add(i)
+                continue
+
+            # 创建一个新的合并组
+            merge_group = [current_block]
+            processed_indices.add(i)
+
+            # 向后查找可以合并到此组的其他块
+            for j in range(i + 1, len(ocr_blocks)):
+                if j in processed_indices:
+                    continue
+                
+                next_block = ocr_blocks[j]
+                next_tag = next_block.get('layout_info', {}).get('region_type', 'unknown')
+
+                # 合并条件：语义标签相同，且在空间上是连续的
+                if next_tag == current_tag:
+                    # 简单的空间连续性判断：下一个块的左上角Y坐标与当前组的
+                    # 最后一个块的左下角Y坐标相差不大（在一个行高内）
+                    last_block_in_group = merge_group[-1]
+                    y_gap = next_block['bbox'][1] - last_block_in_group['bbox'][3]
+                    line_height = last_block_in_group['bbox'][3] - last_block_in_group['bbox'][1]
+                    
+                    if y_gap < line_height: # 垂直间隙小于一个行高
+                        merge_group.append(next_block)
+                        processed_indices.add(j)
+
+            # 3. 将合并组中的所有块聚合成一个大块
+            if len(merge_group) > 1:
+                # 合并文本
+                full_text = "\n".join([b['text'] for b in merge_group])
+                # 合并边界框
+                min_x = min(b['bbox'][0] for b in merge_group)
+                min_y = min(b['bbox'][1] for b in merge_group)
+                max_x = max(b['bbox'][2] for b in merge_group)
+                max_y = max(b['bbox'][3] for b in merge_group)
+                
+                # 计算合并后的平均置信度
+                avg_conf = np.mean([b['confidence'] for b in merge_group])
+
+                merged_block = {
+                    'text': full_text,
+                    'confidence': int(avg_conf),
+                    'bbox': [min_x, min_y, max_x, max_y],
+                    'word_num': len(full_text.split()),
+                    'line_num': len(full_text.split('\n')),
+                    'par_num': 1, # 整个组合并成一个段落
+                    'block_num': merge_group[0]['block_num'],
+                    'layout_info': {'region_type': f"Merged-{current_tag}"}
+                }
+                merged_blocks.append(merged_block)
+                self.logger_func(f"  -> 成功将 {len(merge_group)} 个 '{current_tag}' 块合并。", "DEBUG")
+            else:
+                # 如果组里只有一个块，直接保留
+                merged_blocks.append(current_block)
+
+        # 4. 构建新的 ocr_data
+        new_ocr_data = ocr_data.copy()
+        new_ocr_data['text_blocks'] = merged_blocks
+        new_ocr_data['full_text'] = "\n\n".join([b['text'] for b in merged_blocks])
+        new_ocr_data['total_blocks'] = len(merged_blocks)
+        
+        self.logger_func(f"🧠 语义合并完成，文本块从 {len(ocr_blocks)} 个减少到 {len(merged_blocks)} 个。", "SUCCESS")
+        return new_ocr_data        
+    def recognize_text_enhanced(self, image_path: str, enable_preprocessing: bool = True) -> Tuple[Optional[Dict], str]:
+        """
+        CVOCR增强文本识别的核心实现 (V4.9 - LayoutLMv2语义合并集成版)
+        - 新增一个基于LayoutLMv2的语义合并分支，在所有识别和分析完成后执行。
+        - 根据用户的GUI选择，在纯几何合并和高级语义合并之间进行切换。
+        - 确保在调用语义合并前，所有必要的数据（初步OCR结果、LayoutLMv2分析）都已准备就绪。
         """
         recognition_start_time = time.time()
-        self.performance_stats['total_recognitions'] += 1
-        precision_level_enum = precision_override or self.precision_level
-        language_enum = self.language
-        use_advanced_segmentation = self.config.get('enable_advanced_segmentation', False)
-        preprocess_flags = self.config.copy()
-        preprocess_flags.update({
-            'enable_preprocessing': enable_preprocessing,
-            'enable_advanced_segmentation': use_advanced_segmentation,
-            'precision_level': precision_level_enum.value, 
-            'language': language_enum.value
-        })
-        tesseract_timeout = self.config.get('tesseract_process_timeout', 300)
-
-        # --- 核心修正：获取原始尺寸 ---
+        
         try:
-            with Image.open(image_path) as img:
-                original_width, original_height = img.size
-        except Exception as e:
-            self._update_failed_stats()
-            return None, f"无法读取原始图像尺寸: {e}"
-
-        image_processor = AdvancedTextImageProcessor() 
-        processed_image_np, preprocess_msg, metadata = image_processor.intelligent_preprocess_image(
-            image_path, **preprocess_flags 
-        )
-        if processed_image_np is None:
-            self._update_failed_stats()
-            return None, f"图像预处理失败: {preprocess_msg}"
-        
-        # 计算预处理过程中的缩放比例
-        processed_height, processed_width = processed_image_np.shape[:2]
-        scale_x = original_width / processed_width if processed_width > 0 else 1.0
-        scale_y = original_height / processed_height if processed_height > 0 else 1.0
-        
-        if self.config.get('enable_super_resolution', False):
-            if self.fsrcnn_model and processed_image_np is not None:
-                h_before, w_before = processed_image_np.shape[:2]
-                processed_image_np = self._apply_fsrcnn_enhancement(processed_image_np)
-                h_after, w_after = processed_image_np.shape[:2]
-                if h_after > 0 and w_after > 0:
-                    scale_x *= w_before / w_after
-                    scale_y *= h_before / h_after
-                self.performance_stats['component_usage']['fsrcnn'] += 1
-        
-        layout_info, context_info, transformer_results = None, None, None
-        if self.config.get('enable_layout_analysis', False) and self.layoutlm_model:
-            layout_info = self._analyze_layout_with_layoutlmv2(processed_image_np)
-            self.performance_stats['component_usage']['layoutlmv2'] += 1
-        if self.config.get('enable_transformer_ocr', False) and self.trocr_model:
-            transformer_results = self._apply_transformer_ocr(processed_image_np)
-            self.performance_stats['component_usage']['transformer_ocr'] += 1
-
-        ocr_data, full_text = None, None
-        is_trocr_result_valid = False
-        if transformer_results and 'text' in transformer_results and transformer_results['text'].strip():
-            trocr_text = transformer_results['text'].strip()
-            if len(trocr_text) > 2 and re.search(r'[a-zA-Z\u4e00-\u9fa5]', trocr_text):
-                is_trocr_result_valid = True
-        
-        if is_trocr_result_valid:
-            full_text = transformer_results['text']
-        elif use_advanced_segmentation:
+            # --- 步骤 1: 初始化统计和配置 ---
+            self.performance_stats['total_recognitions'] += 1
+            
+            # --- 步骤 2: 图像预处理 (统一入口) ---
+            self.logger_func("工作流步骤1: 正在应用统一的图像预处理...", "INFO")
+            image_processor = AdvancedTextImageProcessor()
+            processed_image_np, preprocess_msg, metadata = image_processor.intelligent_preprocess_image(
+                image_path, **self.config
+            )
+            if processed_image_np is None:
+                self._update_failed_stats()
+                return None, f"图像预处理失败: {preprocess_msg}"
+            
+            # 计算坐标转换比例
             try:
-                seg_precision_str = self.config.get('segmentation_precision', 'balanced')
-                seg_precision_enum = OCRPrecisionLevel(seg_precision_str)
-                # **关键：将缩放比例传递下去**
-                ocr_data, full_text = self._run_segmentation_and_recognize(
-                    processed_image_np, seg_precision_enum, (scale_x, scale_y)
-                )
+                with Image.open(image_path) as img:
+                    original_width, original_height = img.size
             except Exception as e:
-                ocr_data, full_text = None, None
-        
-        if ocr_data is None and not is_trocr_result_valid:
-             try:
-                 image_pil = Image.fromarray(cv2.cvtColor(processed_image_np, cv2.COLOR_BGR2RGB))
-                 tesseract_config_str = self._get_tesseract_config(precision_level_enum, language_enum)
-                 tesseract_result = self._execute_tesseract_subprocess(
-                     image_pil=image_pil, tesseract_cmd_path=self.tesseract_path,
-                     config_str=tesseract_config_str, timeout=tesseract_timeout
-                 )
-                 self.performance_stats['component_usage']['tesseract'] += 1
-                 if tesseract_result["status"] == "error":
-                     raise CVOCRException(tesseract_result['message'])
-                 ocr_data = tesseract_result["data"]
-                 full_text = tesseract_result["full_text"]
-                 # **关键：对整页识别的结果也进行坐标转换**
-                 if ocr_data and 'left' in ocr_data:
-                     ocr_data['left'] = [int(x * scale_x) for x in ocr_data['left']]
-                     ocr_data['top'] = [int(y * scale_y) for y in ocr_data['top']]
-                     ocr_data['width'] = [int(w * scale_x) for w in ocr_data['width']]
-                     ocr_data['height'] = [int(h * scale_y) for h in ocr_data['height']]
-             except Exception as e:
-                 self._update_failed_stats()
-                 return None, f"Tesseract整页识别失败: {str(e)}"
+                self._update_failed_stats()
+                return None, f"无法读取原始图像尺寸: {e}"
 
-        if self.config.get('enable_context_analysis', False) and full_text:
-            avg_confidence = 0
-            if ocr_data and ocr_data.get('conf'):
-                valid_confs = [c for c in ocr_data.get('conf', []) if c != -1]
-                if valid_confs:
-                    avg_confidence = sum(valid_confs) / len(valid_confs)
-            if not is_trocr_result_valid and avg_confidence < 75.0:
+            processed_height, processed_width = processed_image_np.shape[:2]
+            scale_x = original_width / processed_width if processed_width > 0 else 1.0
+            scale_y = original_height / processed_height if processed_height > 0 else 1.0
+
+            # --- 步骤 3: 文本与元素检测 (根据模式选择) ---
+            text_regions = []
+            shape_blocks = []
+
+            # 【核心修正】: 检查是否为快速模式
+            is_quick_mode = self.config.get('quick_mode', False)
+            
+            if is_quick_mode:
+                # 工作流 C: 快速模式
+                self.logger_func("工作流步骤2: 模式[快速OCR] -> 跳过文本检测，直接进行整页识别...", "INFO")
+                # 在这种模式下，我们不需要检测区域，所以 text_regions 保持为空列表
+                # 后续的识别逻辑将直接处理整张图片
+            
+            else:
+                is_full_element_mode = self.config.get('enable_advanced_segmentation', False)
+
+                if is_full_element_mode:
+                    # 工作流 A: 全元素检测模式
+                    self.logger_func("工作流步骤2: 模式[全元素检测] -> 正在使用YOLO进行检测...", "INFO")
+                    if self.unified_detector and self.unified_detector.net:
+                        self.performance_stats['component_usage']['unified_detector'] += 1
+                        all_detected_objects = self.unified_detector.detect_all_objects(processed_image_np)
+                        
+                        for obj in all_detected_objects:
+                            x1, y1, x2, y2 = obj['bbox']
+                            if obj['label'] in ['text', 'table']:
+                                points = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+                                text_regions.append(points)
+                            else:
+                                shape_blocks.append({
+                                    'text': f"[{obj['label'].upper()}]", 'confidence': int(obj['confidence'] * 100),
+                                    'bbox': obj['bbox'], 'is_shape': True,
+                                    'word_num': 1, 'line_num': 1, 'par_num': 1, 'block_num': 999 
+                                })
+                        self.logger_func(f"YOLO检测到 {len(text_regions)} 个文本/表格区域和 {len(shape_blocks)} 个图形。", "INFO")
+                    else:
+                        self.logger_func("⚠️ 全元素检测模式已启用，但YOLO检测器未加载。", "WARNING")
+                else:
+                    # 工作流 B: 纯文本OCR模式
+                    self.logger_func("工作流步骤2: 模式[纯文本OCR] -> 正在使用高级分割技术进行检测...", "INFO")
+                    self.performance_stats['component_usage']['advanced_segmentation'] += 1
+                    enabled_algorithms = self.config.get('enabled_segmentation_algorithms', [])
+                    self.text_detector.config.update(self.config)
+                    
+                    text_regions, _ = self.text_detector.detect_text_regions_advanced(
+                        processed_image_np, enabled_algorithms
+                    )
+                    self.logger_func(f"高级分割技术检测到 {len(text_regions)} 个文本区域。", "INFO")
+
+            # --- 步骤 4: 区域的初步识别 (或整页识别) ---
+            # 【核心修正】: 根据是否为快速模式，选择不同的识别策略
+            if is_quick_mode:
+                self.logger_func("工作流步骤3: 将整张预处理后的图片送入Tesseract进行端到端识别...", "INFO")
+                
+                # 直接调用 Tesseract 处理整张图片
+                full_image_pil = Image.fromarray(cv2.cvtColor(processed_image_np, cv2.COLOR_BGR2RGB))
+                tesseract_configs = self._get_tesseract_config() # 获取为快速模式配置的 --psm 3 等参数
+                
+                # 直接执行 Tesseract 并获取结果
+                tesseract_result = self._execute_tesseract_subprocess(
+                    image_pil=full_image_pil,
+                    tesseract_cmd_path=self.tesseract_path,
+                    config_str=tesseract_configs,
+                    timeout=self.config.get('tesseract_process_timeout', 300)
+                )
+
+                if tesseract_result['status'] == 'success':
+                    ocr_data = tesseract_result['data']
+                    full_text = tesseract_result['full_text']
+                    # 将 Tesseract 返回的块级坐标应用缩放
+                    for key in ['left', 'top', 'width', 'height']:
+                        if key in ocr_data:
+                            ocr_data[key] = [int(v * (scale_x if key in ['left', 'width'] else scale_y)) for v in ocr_data[key]]
+                else:
+                    raise CVOCRException(f"Tesseract在快速模式下执行失败: {tesseract_result.get('message', '未知错误')}")
+            else:
+                # 原始逻辑：对分割出的区域进行识别
+                self.logger_func(f"工作流步骤3: 将 {len(text_regions)} 个区域送入识别引擎进行初步识别...", "INFO")
+                ocr_data, full_text = self._run_segmentation_and_recognize(
+                    processed_image_np, (scale_x, scale_y), text_regions
+                )
+
+            # --- 步骤 5: AI分析 (为语义合并和最终结果做准备) ---
+            self.logger_func("工作流步骤4: 正在执行AI分析...", "INFO")
+            layout_info, context_info, transformer_results = None, None, None
+            
+            # LayoutLMv2 必须在语义合并前运行
+            if (self.config.get('enable_layout_analysis', False) or self.config.get('enable_layoutlm_merge', False)) and self.layoutlm_model:
+                layout_info = self._analyze_layout_with_layoutlmv2(processed_image_np)
+                self.performance_stats['component_usage']['layoutlmv2'] += 1
+
+            if self.config.get('enable_context_analysis', False) and full_text and self.gpt_neo_model:
                 full_text, context_info = self._analyze_context_with_gpt_neo(full_text, ocr_data or {})
                 self.performance_stats['component_usage']['gpt_neo'] += 1
-        
-        final_results = self._post_process_cvocr_results(
-            ocr_data, full_text, precision_level_enum, 
-            layout_info, context_info, transformer_results, metadata
-        )
-        
-        processing_time = time.time() - recognition_start_time
-        self._update_success_stats(processing_time)
-        summary_msg = self._generate_cvocr_result_summary(final_results, processing_time, preprocess_msg)
-        final_results['processing_metadata']['total_processing_time'] = processing_time
-        return final_results, summary_msg
-    
-    
-    
-    
-    def _apply_fsrcnn_enhancement(self, image: np.ndarray) -> np.ndarray:
-        """
-        应用FSRCNN超分辨率增强 (V3.11 修正为无损放大模拟)。
-        - 移除了破坏性的锐化和边缘融合。
-        - 使用高质量的双三次插值进行放大，作为更安全的模拟方式。
-        """
-        try:
-            h, w = image.shape[:2]
-            scale_factor = self.fsrcnn_model.get('scale_factor', 2)
+
             
-            # --- 核心修正：只使用高质量的插值放大 ---
-            # 这种方法不会引入破坏性的伪影，对后续的分割和识别更友好。
-            new_h, new_w = int(h * scale_factor), int(w * scale_factor)
-            if new_h > 0 and new_w > 0:
-                enhanced = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-                logger.info(f"FSRCNN模拟增强完成 (高质量放大): {w}x{h} -> {new_w}x{new_h}")
-                return enhanced
+            
+            # --- 步骤 6: 最终结果整合 (包含语义合并分支) ---
+            self.logger_func("工作流步骤5: 正在整合最终结果...", "INFO")
+            # 检查是否需要执行高级语义合并
+            if (self.config.get('enable_smart_line_merge') and 
+                self.config.get('enable_layoutlm_merge') and 
+                layout_info and not layout_info.get('error')):
+                
+                # 6a. 先进行一次常规的后处理，得到待合并的文本块
+                initial_results = self._post_process_cvocr_results(
+                    ocr_data, full_text, 
+                    layout_info, context_info, transformer_results, metadata,
+                    shape_blocks=shape_blocks
+                )
+                
+                # 6b. 调用新的语义合并方法
+                final_results_dict = self._merge_blocks_by_layoutlm(initial_results, layout_info)
+
+                # 更新 full_text 以反映合并后的结果
+                full_text = final_results_dict['full_text']
             else:
-                logger.warning("FSRCNN计算出的新尺寸无效，跳过增强。")
-                return image
+                # 6c. 如果不使用语义合并，则走原来的常规后处理流程
+                if self.config.get('enable_layoutlm_merge'):
+                    self.log_message("⚠️ 请求了语义合并，但LayoutLMv2未启用或分析失败，回退到几何合并。", "WARNING")
+                
+                final_results_dict = self._post_process_cvocr_results(
+                    ocr_data, full_text, 
+                    layout_info, context_info, transformer_results, metadata,
+                    shape_blocks=shape_blocks
+                )
+
+            # --- 步骤 7: 生成摘要并返回 ---
+            processing_time = time.time() - recognition_start_time
+            self._update_success_stats(processing_time)
+            summary_msg = self._generate_cvocr_result_summary(final_results_dict, processing_time, preprocess_msg)
+            final_results_dict['processing_metadata']['total_processing_time'] = processing_time
+            
+            return final_results_dict, summary_msg
 
         except Exception as e:
-            logger.error(f"FSRCNN增强处理失败: {e}", exc_info=True)
-            return image
+            self._update_failed_stats()
+            error_message = f"在recognize_text_enhanced主流程中发生严重错误: {str(e)}"
+            self.logger_func(f"❌ {error_message}\n{traceback.format_exc()}", "ERROR")
+            return None, error_message
+        finally:
+            self.logger_func("识别流程结束。", "DEBUG")
+    def _apply_fsrcnn_enhancement(self, image: np.ndarray) -> np.ndarray:
+        """
+        应用真正的FSRCNN超分辨率增强 (V3.29 DBNet兼容修正版)
+        """
+        # FSRCNN功能已被移除，此函数仅为保留结构，直接返回原图
+        if self.config.get('enable_super_resolution', False):
+             logger.warning("FSRCNN功能已被移除，超分辨率增强将不会执行。")
+        return image
     
     def _analyze_layout_with_layoutlmv2(self, image: np.ndarray) -> Dict:
         """使用真正的LayoutLMv2进行文档布局分析。"""
@@ -4361,15 +5121,7 @@ class EnhancedCVOCRManager:
         try:
             pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             
-            # 调整图像大小到模型期望的输入尺寸 (LayoutLMv2通常是224x224或800x800)
-            # LayoutLMv2Processor会自动处理尺寸，但我们可以预先调整以避免内存问题
-            target_size = (800, 800) # LayoutLMv2常见输入尺寸
-            if pil_image.width > target_size[0] or pil_image.height > target_size[1]:
-                pil_image = pil_image.resize(target_size, Image.Resampling.LANCZOS)
-
             # 准备模型输入
-            # LayoutLMv2Processor需要图像和可选的OCR文本/盒子来做预处理
-            # 暂时不提供OCR文本，让模型自己从图像中提取
             encoding = self.layoutlm_processor(pil_image, return_tensors="pt").to(self.device)
             
             # 模型推理
@@ -4381,25 +5133,12 @@ class EnhancedCVOCRManager:
             token_boxes = encoding.bbox.squeeze().tolist()
             tokens = self.layoutlm_processor.tokenizer.convert_ids_to_tokens(encoding.input_ids.squeeze().tolist())
             
-            # 将token级别的预测聚合为有意义的区域
-            # 这是一个简化的聚合逻辑，实际应用会更复杂
             text_regions = []
             for i, pred in enumerate(predictions):
-                if pred == 0: # 假设0是背景/非文本
-                    continue
-                
-                # 排除特殊token
-                if tokens[i] in ['[CLS]', '[SEP]', '[PAD]']:
+                if pred == 0 or tokens[i] in ['[CLS]', '[SEP]', '[PAD]']:
                     continue
 
                 box = token_boxes[i]
-                # Bounding box coordinates are typically normalized (0-1000) or pixel values
-                # We need to scale them back if they were normalized
-                # LayoutLMv2's processor often outputs normalized boxes.
-                # Assuming here the boxes are directly usable or require minimal scaling.
-                
-                # A simple aggregation logic: each token is a "region" for now
-                # More robust: group adjacent tokens of the same predicted type
                 text_regions.append({
                     'text': tokens[i],
                     'bbox': [box[0], box[1], box[2], box[3]], # x_min, y_min, x_max, y_max
@@ -4408,16 +5147,15 @@ class EnhancedCVOCRManager:
                     'confidence': float(torch.softmax(outputs.logits, dim=-1).squeeze()[i][pred].item())
                 })
             
-            # 进一步聚合文本区域，并确保坐标在图像范围内
             aggregated_regions = self._aggregate_layoutlmv2_regions(text_regions, image.shape[1], image.shape[0])
 
             layout_analysis = {
                 'text_regions': aggregated_regions,
                 'document_structure': {
-                    'estimated_language': 'mixed', # LayoutLMv2本身不直接检测语言，需结合OCR结果
+                    'estimated_language': 'mixed',
                     'text_density': 'medium'
                 },
-                'confidence_score': float(torch.softmax(outputs.logits, dim=-1).max().item()), # 整个文档的最高预测置信度
+                'confidence_score': float(torch.softmax(outputs.logits, dim=-1).max().item()),
             }
             
             logger.info(f"LayoutLMv2布局分析完成，检测到 {len(aggregated_regions)} 个聚合文本区域。")
@@ -4429,11 +5167,9 @@ class EnhancedCVOCRManager:
     def _aggregate_layoutlmv2_regions(self, regions: List[Dict], image_width: int, image_height: int) -> List[Dict]:
         """
         聚合LayoutLMv2输出的token级区域，形成更粗粒度的文本块。
-        这里是一个简化的实现，实际需要更复杂的启发式算法或聚类。
         """
         aggregated_output = []
         
-        # 将归一化的box（0-1000）转换为像素坐标
         def scale_box(box):
             return [
                 int(box[0] / 1000 * image_width),
@@ -4442,7 +5178,6 @@ class EnhancedCVOCRManager:
                 int(box[3] / 1000 * image_height)
             ]
 
-        # 先按行和类型排序
         regions.sort(key=lambda r: (r['bbox'][1], r['bbox'][0], r['type_id']))
 
         current_block = None
@@ -4450,21 +5185,14 @@ class EnhancedCVOCRManager:
             scaled_bbox = scale_box(region['bbox'])
             if current_block is None:
                 current_block = {
-                    'text': region['text'],
-                    'bbox': scaled_bbox,
-                    'type_name': region['type_name'],
-                    'type_id': region['type_id'],
-                    'confidence': region['confidence'],
-                    'count': 1
+                    'text': region['text'], 'bbox': scaled_bbox, 'type_name': region['type_name'],
+                    'type_id': region['type_id'], 'confidence': region['confidence'], 'count': 1
                 }
             else:
-                # 简单的合并逻辑：如果类型相同且在水平/垂直方向上接近
-                # 这里可以加入更多的判断，例如行间距、字符间距等
-                overlap_threshold = 20 # 像素容忍度
+                overlap_threshold = 20
                 if region['type_id'] == current_block['type_id'] and \
-                   abs(scaled_bbox[1] - current_block['bbox'][1]) < overlap_threshold: # 同一行
+                   abs(scaled_bbox[1] - current_block['bbox'][1]) < overlap_threshold:
                     
-                    # 合并文本和边界框
                     current_block['text'] += " " + region['text']
                     current_block['bbox'][0] = min(current_block['bbox'][0], scaled_bbox[0])
                     current_block['bbox'][1] = min(current_block['bbox'][1], scaled_bbox[1])
@@ -4473,67 +5201,100 @@ class EnhancedCVOCRManager:
                     current_block['confidence'] = (current_block['confidence'] * current_block['count'] + region['confidence']) / (current_block['count'] + 1)
                     current_block['count'] += 1
                 else:
-                    # 新的文本块
                     aggregated_output.append(current_block)
                     current_block = {
-                        'text': region['text'],
-                        'bbox': scaled_bbox,
-                        'type_name': region['type_name'],
-                        'type_id': region['type_id'],
-                        'confidence': region['confidence'],
-                        'count': 1
+                        'text': region['text'], 'bbox': scaled_bbox, 'type_name': region['type_name'],
+                        'type_id': region['type_id'], 'confidence': region['confidence'], 'count': 1
                     }
         if current_block:
             aggregated_output.append(current_block)
             
-        # 清理和最终格式化
         final_regions = []
         for block in aggregated_output:
             final_regions.append({
                 'bbox': [int(coord) for coord in block['bbox']],
-                'text': block['text'].strip(),
+                'text': block['text'].strip().replace(' ##', ''),
                 'type': block['type_name'],
                 'confidence': block['confidence']
             })
         
         return final_regions
 
-    def _apply_transformer_ocr(self, image: np.ndarray) -> Dict:
-        """使用真正的TrOCR模型进行端到端OCR识别。"""
+    def _apply_transformer_ocr(self, images: Union[np.ndarray, List[np.ndarray]]) -> Union[Dict, List[Dict]]:
+        """
+        【修正和增强版】使用真正的TrOCR模型进行端到端OCR识别。
+        """
         import torch
         from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 
         if not self.trocr_model or not self.trocr_processor:
             logger.warning("TrOCR模型或处理器未加载，无法进行TrOCR识别。")
-            return {'error': 'TrOCR模型未加载', 'text': ''}
+            if isinstance(images, list):
+                return [{'error': 'TrOCR模型未加载', 'text': '', 'confidence': 0.0} for _ in images]
+            else:
+                return {'error': 'TrOCR模型未加载', 'text': '', 'confidence': 0.0}
 
+        is_single_image = False
+        if isinstance(images, np.ndarray):
+            is_single_image = True
+            images_list = [images]
+        elif isinstance(images, list):
+            images_list = images
+        else:
+            error_msg = f"无效的输入类型: {type(images)}"
+            logger.error(error_msg)
+            return {'error': error_msg, 'text': '', 'confidence': 0.0}
+
+        if not images_list:
+            return [] if not is_single_image else {'error': '输入图像为空', 'text': '', 'confidence': 0.0}
+            
         try:
-            pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            pil_images = [Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in images_list]
 
-            # 准备模型输入
-            pixel_values = self.trocr_processor(images=pil_image, return_tensors="pt").pixel_values.to(self.device)
+            pixel_values = self.trocr_processor(images=pil_images, return_tensors="pt").pixel_values.to(self.device)
             
-            # 生成文本ID
             with torch.no_grad():
-                generated_ids = self.trocr_model.generate(pixel_values)
+                generated_output = self.trocr_model.generate(
+                    pixel_values, output_scores=True, return_dict_in_generate=True
+                )
             
-            # 解码为文本
-            generated_text = self.trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            generated_text_list = self.trocr_processor.batch_decode(generated_output.sequences, skip_special_tokens=True)
             
-            transformer_results = {
-                'method': 'transformer_ocr',
-                'model_name': 'microsoft/trocr-base-handwritten', # 根据实际加载的模型更新
-                'text': generated_text,
-                'confidence': 1.0 # TrOCR不直接输出置信度，这里给个高默认值
-            }
-            logger.info(f"TrOCR识别完成: '{generated_text[:min(len(generated_text), 50)]}...'")
+            sequence_confidences = []
+            log_probs = torch.nn.functional.log_softmax(torch.stack(generated_output.scores, dim=1), dim=-1)
             
-            if 'component_usage' in self.performance_stats: # 更新性能统计
-                self.performance_stats['component_usage']['transformer_ocr'] += 1
-            return transformer_results
+            for i in range(generated_output.sequences.shape[0]):
+                sequence = generated_output.sequences[i, 1:]
+                seq_len = (sequence != self.trocr_processor.tokenizer.pad_token_id).sum().item()
+                if seq_len > 0:
+                    token_log_probs = log_probs[i, torch.arange(seq_len), sequence[:seq_len]].sum()
+                    avg_log_prob = token_log_probs / seq_len
+                    confidence = torch.exp(avg_log_prob).item()
+                else:
+                    confidence = 0.0
+                sequence_confidences.append(confidence)
+
+            results_list = []
+            model_name = self.config.get('transformer_ocr_model', 'unknown')
+            for i, text in enumerate(generated_text_list):
+                results_list.append({
+                    'method': 'transformer_ocr',
+                    'model_name': model_name,
+                    'text': text,
+                    'confidence': sequence_confidences[i] * 100
+                })
+            
+            logger.info(f"TrOCR批量识别完成 {len(images_list)} 个图像。")
+            
+            return results_list[0] if is_single_image else results_list
+            
         except Exception as e:
             logger.error(f"TrOCR处理失败: {e}\n{traceback.format_exc()}")
-            return {'error': str(e), 'text': ''}
+            error_result = {'error': str(e), 'text': '', 'confidence': 0.0}
+            if isinstance(images, list):
+                return [error_result for _ in images]
+            else:
+                return error_result
     
     def _analyze_context_with_gpt_neo(self, text: str, ocr_data: Dict) -> Tuple[str, Dict]:
         """使用真正的GPT-Neo进行上下文分析和文本优化。"""
@@ -4545,8 +5306,7 @@ class EnhancedCVOCRManager:
             return text, {'error': 'GPT-Neo模型未加载'}
 
         try:
-            # 限制输入文本长度，GPT-Neo-125M模型的上下文窗口较小
-            max_input_length = 512 - 50 # 留一些空间给生成文本
+            max_input_length = 512 - 50
             if len(text.split()) > max_input_length:
                 text = " ".join(text.split()[:max_input_length])
                 logger.warning(f"GPT-Neo输入文本过长，已截断至 {max_input_length} token。")
@@ -4562,173 +5322,176 @@ class EnhancedCVOCRManager:
 
             input_ids = self.gpt_neo_tokenizer(prompt, return_tensors="pt").input_ids.to(self.device)
             
-            max_new_tokens = min(200, int(len(input_ids[0]) * 0.5) + 20) # 限制生成长度，避免模型跑偏
+            max_new_tokens = min(200, int(len(input_ids[0]) * 0.5) + 20)
             
             with torch.no_grad():
                 gen_tokens = self.gpt_neo_model.generate(
-                    input_ids,
-                    do_sample=True,
-                    temperature=0.7, # 增加一些创造性
-                    top_p=0.9,       # 增加多样性
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=self.gpt_neo_tokenizer.eos_token_id # 确保 pad_token_id 设置正确
+                    input_ids, do_sample=True, temperature=0.7, top_p=0.9,
+                    max_new_tokens=max_new_tokens, pad_token_id=self.gpt_neo_tokenizer.eos_token_id
                 )
             
             corrected_text_full = self.gpt_neo_tokenizer.decode(gen_tokens[0], skip_special_tokens=True)
             
-            # 尝试提取 "Corrected Text:" 之后的部分
             if "Corrected Text:" in corrected_text_full:
                 optimized_text = corrected_text_full.split("Corrected Text:", 1)[1].strip()
             else:
-                # 如果没有找到分隔符，说明模型可能没有遵循指令，尝试回退或简单清理
                 optimized_text = corrected_text_full.replace(prompt.split('---')[0].strip(), '').strip()
-                optimized_text = optimized_text.replace(text, '').strip() # 再次尝试移除原始prompt
-                if not optimized_text: # 如果移除后为空，说明提取失败，使用原始文本
+                optimized_text = optimized_text.replace(text, '').strip()
+                if not optimized_text:
                     optimized_text = text
                 
-            # 简单的差异计算来估计纠正数量
-            corrections_applied = 0
-            if optimized_text != text:
-                corrections_applied = abs(len(text) - len(optimized_text)) # 粗略估计
+            corrections_applied = abs(len(text) - len(optimized_text))
             
             context_analysis = {
                 'original_length': len(text),
                 'optimized_length': len(optimized_text),
                 'corrections_applied': corrections_applied,
-                'semantic_coherence': 0.95, # 假设模型提升了语义连贯性
+                'semantic_coherence': 0.95,
                 'processing_method': 'gpt-neo-125m',
-                'model_confidence': 0.90 # 假设模型对自己的输出有较高信心
+                'model_confidence': 0.90
             }
             
             logger.info(f"GPT-Neo上下文分析完成，文本长度从 {len(text)} 变为 {len(optimized_text)}，应用了约 {corrections_applied} 处修正。")
-            if 'component_usage' in self.performance_stats: # 更新性能统计
-                self.performance_stats['component_usage']['gpt_neo'] += 1
+            self.performance_stats['component_usage']['gpt_neo'] += 1
             return optimized_text, context_analysis
             
         except Exception as e:
             logger.error(f"GPT-Neo上下文分析失败: {e}\n{traceback.format_exc()}")
             return text, {'error': str(e)}
     
-    def _post_process_cvocr_results(self, data: Optional[Dict], full_text: str, precision_level: OCRPrecisionLevel, 
+    def _post_process_cvocr_results(self, data: Optional[Dict], full_text: str,
                                     layout_info: Dict = None, context_info: Dict = None, 
-                                    transformer_results: Dict = None, preprocess_metadata: Dict = None) -> Dict:
+                                    transformer_results: Dict = None, preprocess_metadata: Dict = None,
+                                    shape_blocks: List[Dict] = None) -> Dict:
         """
-        CVOCR结果后处理和整合 (V3.7 逻辑修复版)。
-        - 统一处理来自不同OCR源（TrOCR, Tesseract）的数据。
-        - 只有在TrOCR结果有效时，才将其作为唯一结果进行整合。
-        - 否则，处理来自Tesseract（通过高级分割或整页识别）的数据。
-        - 将所有相关信息（布局、上下文、元数据等）整合到最终的结构化字典中。
+        CVOCR结果后处理和整合 (V3.30 全元素检测升级版)。
+        此方法是结果处理的核心，它将来自不同模块的原始数据整合成一个结构化的、
+        内容丰富的最终结果字典。
+        - 整合来自Tesseract或TransformerOCR的文本识别结果。
+        - 合并来自UnifiedObjectDetector的图形检测结果。
+        - 根据页面位置对所有元素（文本和图形）进行排序。
+        - 重新生成包含所有元素标签的完整文本报告。
+        - 计算最终的统计数据（总块数、字符数、平均置信度）。
+        - 附加所有相关的元数据，如使用的组件、配置和预处理信息。
+
+        Args:
+            data (Optional[Dict]): 来自Tesseract的原始OCR数据。
+            full_text (str): 来自主要OCR引擎的纯文本结果。
+            layout_info (Dict, optional): 来自LayoutLMv2的布局分析结果。
+            context_info (Dict, optional): 来自GPT-Neo的上下文分析结果。
+            transformer_results (Dict, optional): 来自TransformerOCR的整页识别结果。
+            preprocess_metadata (Dict, optional): 图像预处理过程的元数据。
+            shape_blocks (List[Dict], optional): 检测到的图形元素列表。
+
+        Returns:
+            Dict: 一个结构化的字典，包含所有整合后的识别结果和元数据。
         """
         try:
+            # 初始化一个列表来存储所有处理过的文本块
             text_blocks = []
             
-            # 推断处理后的图像尺寸，用于创建TrOCR的边界框
+            # 获取图像尺寸，用于当TrOCR结果作为唯一结果时填充边界框
             image_w, image_h = 1000, 800 # 默认值
             if preprocess_metadata and 'final_shape' in preprocess_metadata:
                 image_h, image_w = preprocess_metadata['final_shape'][:2]
 
-            # --- 关键修正：重新进行TrOCR结果的有效性验证，确保与主流程逻辑一致 ---
+            # 检查TrOCR结果是否有效并应作为主要结果
             is_trocr_result_valid = False
             if self.config.get('enable_transformer_ocr', False) and transformer_results and 'text' in transformer_results and transformer_results['text'].strip():
                 trocr_text = transformer_results['text'].strip()
-                # 使用与主流程中完全相同的验证逻辑
+                # 检查结果是否包含有效字符且长度合理
                 if len(trocr_text) > 2 and re.search(r'[a-zA-Z\u4e00-\u9fa5]', trocr_text):
                     is_trocr_result_valid = True
 
-            # --- 结果整合分支逻辑 ---
             if is_trocr_result_valid:
-                # 分支一: TrOCR结果有效，将其作为唯一的文本块进行整合
-                logger.info("TrOCR结果有效，将其整合为唯一的识别文本块。")
+                # 如果TrOCR结果有效，则将其构造成一个覆盖整个图像的文本块
+                self.logger_func("TrOCR结果有效，将其整合为唯一的识别文本块。", "INFO")
                 text_blocks.append({
-                    'text': transformer_results['text'],
-                    'confidence': int(transformer_results.get('confidence', 99.0)), # TrOCR不直接输出置信度，使用高默认值
-                    'bbox': [0, 0, image_w, image_h], # 假设覆盖整个图像
+                    'text': transformer_results['text'], 
+                    'confidence': int(transformer_results.get('confidence', 99.0)),
+                    'bbox': [0, 0, image_w, image_h], 
                     'word_num': len(transformer_results['text'].split()),
-                    'line_num': 1, 
-                    'par_num': 1, 
-                    'block_num': 1,
-                    'transformer_enhanced': True # 明确标记此块来自TrOCR
+                    'line_num': 1, 'par_num': 1, 'block_num': 1, 
+                    'transformer_enhanced': True
                 })
-                # 注意：如果GPT-Neo运行了，full_text已经是优化后的版本，这里无需再次赋值
             
-            elif data:
-                # 分支二: TrOCR无效或未启用，处理来自Tesseract的数据
-                # (数据可能来自高级分割或整页识别)
-                if 'text' not in data or not isinstance(data.get('text'), list):
-                    logger.warning("接收到的Tesseract数据结构异常或为空，无法解析文本块。")
-                else:
-                    for i in range(len(data['text'])):
-                        # 安全地获取置信度，处理-1的情况
-                        conf_str = data['conf'][i] if i < len(data['conf']) else '-1'
-                        conf = int(float(conf_str)) if conf_str != '-1' else 0
-                        
-                        text = data['text'][i].strip()
-                        
-                        # 根据用户设置的置信度阈值进行过滤
-                        if conf < self.config.get('confidence_threshold', 60) or not text:
-                            continue
-                        
-                        # 安全地获取边界框坐标
-                        if all(k in data and i < len(data[k]) for k in ['left', 'top', 'width', 'height']):
-                            bbox_coords = [
-                                int(data['left'][i]), int(data['top'][i]),
-                                int(data['left'][i] + data['width'][i]), int(data['top'][i] + data['height'][i])
-                            ]
-                        else:
-                            logger.warning(f"文本块 '{text[:20]}...' 的边界框数据不完整，已跳过。")
-                            continue
+            elif data and 'text' in data and isinstance(data.get('text'), list):
+                # 如果使用Tesseract等传统OCR，则逐个处理其返回的文本块
+                for i in range(len(data['text'])):
+                    conf_str = data['conf'][i] if i < len(data['conf']) else '-1'
+                    conf = int(float(conf_str)) if conf_str != '-1' else 0
+                    text = data['text'][i].strip()
+                    
+                    # 根据置信度阈值和文本内容过滤无效块
+                    if conf < self.config.get('confidence_threshold', 60) or not text:
+                        continue
+                    
+                    # 确保边界框数据完整
+                    if all(k in data and i < len(data[k]) for k in ['left', 'top', 'width', 'height']):
+                        bbox_coords = [
+                            int(data['left'][i]), int(data['top'][i]),
+                            int(data['left'][i] + data['width'][i]), int(data['top'][i] + data['height'][i])
+                        ]
+                    else:
+                        self.logger_func(f"文本块 '{text[:20]}...' 的边界框数据不完整，已跳过。", "WARNING")
+                        continue
 
-                        # 构建文本块字典
-                        text_block = {
-                            'text': text, 
-                            'confidence': conf, 
-                            'bbox': bbox_coords,
-                            'word_num': int(data['word_num'][i]) if i < len(data['word_num']) else len(text.split()),
-                            'line_num': int(data['line_num'][i]) if i < len(data['line_num']) else 0,
-                            'par_num': int(data['par_num'][i]) if i < len(data['par_num']) else 0,
-                            'block_num': int(data['block_num'][i]) if i < len(data['block_num']) else 0
-                        }
+                    # 构建结构化的文本块字典
+                    text_block = {
+                        'text': text, 
+                        'confidence': conf, 
+                        'bbox': bbox_coords,
+                        'word_num': int(data['word_num'][i]) if i < len(data['word_num']) else len(text.split()),
+                        'line_num': int(data['line_num'][i]) if i < len(data['line_num']) else 0,
+                        'par_num': int(data['par_num'][i]) if i < len(data['par_num']) else 0,
+                        'block_num': int(data['block_num'][i]) if i < len(data['block_num']) else 0
+                    }
 
-                        # 如果有AI增强信息，则附加
-                        if context_info:
-                            text_block['context_enhanced'] = True
-                        if layout_info:
-                            text_block['layout_info'] = self._match_text_to_layout(text_block, layout_info)
-                        
-                        text_blocks.append(text_block)
+                    # 附加AI增强信息
+                    if context_info: text_block['context_enhanced'] = True
+                    if layout_info: text_block['layout_info'] = self._match_text_to_layout(text_block, layout_info)
+                    
+                    text_blocks.append(text_block)
             
-            # --- 后续处理与整合 (对所有分支的结果都有效) ---
+            # 合并检测到的图形块到结果列表中
+            if shape_blocks:
+                text_blocks.extend(shape_blocks)
             
-            # 按阅读顺序对文本块进行排序（块号 -> 段落号 -> 行号 -> 水平位置）
-            text_blocks.sort(key=lambda x: (x.get('block_num', 0), x.get('par_num', 0), x.get('line_num', 0), x.get('bbox', [0,0,0,0])[0]))
+            # 按照页面阅读顺序（从上到下，从左到右）对所有元素（文本和图形）进行排序
+            text_blocks.sort(key=lambda x: (x.get('bbox', [0,0,0,0])[1], x.get('bbox', [0,0,0,0])[0]))
+            
+            # 重新生成完整的文本报告，现在它将包含图形的标签
+            full_text_sorted = "\n".join([block['text'] for block in text_blocks])
             
             # 计算最终的统计数据
-            total_chars = sum(len(block['text']) for block in text_blocks)
-            avg_confidence = sum(block['confidence'] for block in text_blocks) / len(text_blocks) if text_blocks else 0
+            total_chars = sum(len(block['text']) for block in text_blocks if not block.get('is_shape', False)) # 只统计文本字符
+            # 只对文本块计算平均置信度
+            text_only_blocks = [block for block in text_blocks if not block.get('is_shape', False)]
+            avg_confidence = sum(block['confidence'] for block in text_only_blocks) / len(text_only_blocks) if text_only_blocks else 0
             
-            # 构建最终的、完整的CVOCR结果字典
+            # 构建最终的返回字典
             cvocr_results = {
-                'full_text': full_text.strip() if full_text else '',
+                'full_text': full_text_sorted.strip(), 
                 'text_blocks': text_blocks,
-                'total_blocks': len(text_blocks),
+                'total_blocks': len(text_blocks), 
                 'total_characters': total_chars,
-                'average_confidence': avg_confidence,
-                'precision_level': precision_level.value,
+                'average_confidence': avg_confidence, 
                 'language': self.language.value,
                 'cvocr_components': {
-                    'tesseract_used': bool(data and data.get('text')),
-                    'fsrcnn_used': self.config.get('enable_super_resolution', False),
+                    'tesseract_used': bool(data and data.get('text')), 
+                    'fsrcnn_used': False, # FSRCNN已移除
                     'layoutlmv2_used': self.config.get('enable_layout_analysis', False),
                     'gpt_neo_used': self.config.get('enable_context_analysis', False),
-                    'transformer_ocr_used': is_trocr_result_valid
+                    'transformer_ocr_used': is_trocr_result_valid,
+                    'unified_detector_used': bool(shape_blocks) # 【核心修正】: 正确检查列表是否为空
                 },
-                'layout_analysis': layout_info,
+                'layout_analysis': layout_info, 
                 'context_analysis': context_info,
                 'transformer_results': transformer_results,
                 'processing_metadata': {
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.now().isoformat(), 
                     'version': CVOCRConstants.VERSION,
-                    'config': self.config.copy(),
+                    'config': self.config.copy(), 
                     'preprocess_info': preprocess_metadata
                 }
             }
@@ -4736,22 +5499,21 @@ class EnhancedCVOCRManager:
             
         except Exception as e:
             logger.error(f"CVOCR结果后处理失败: {e}", exc_info=True)
-            # 在失败时也返回一个结构化的错误信息
+            # 返回一个包含错误信息的结构化字典，以避免程序崩溃
             return {
-                'error': f"结果后处理失败: {str(e)}",
+                'error': f"结果后处理失败: {str(e)}", 
                 'full_text': full_text or '',
-                'text_blocks': [],
-                'total_blocks': 0,
+                'text_blocks': [], 
+                'total_blocks': 0, 
                 'total_characters': 0,
                 'average_confidence': 0,
                 'processing_metadata': {
-                    'timestamp': datetime.now().isoformat(),
+                    'timestamp': datetime.now().isoformat(), 
                     'version': CVOCRConstants.VERSION,
-                    'error': True,
+                    'error': True, 
                     'preprocess_info': preprocess_metadata
                 }
             }
-    
     
     def _match_text_to_layout(self, text_block: Dict, layout_info: Dict) -> Dict:
         """将文本块匹配到布局信息"""
@@ -4768,9 +5530,9 @@ class EnhancedCVOCRManager:
                     max_overlap = overlap
                     best_match = region
             
-            if best_match and max_overlap > 0.3: # 至少30%重叠
+            if best_match and max_overlap > 0.3:
                 return {
-                    'region_type': best_match.get('type', best_match.get('type_name', 'unknown')), # 兼容LayoutLMv2的type_name
+                    'region_type': best_match.get('type', best_match.get('type_name', 'unknown')),
                     'layout_confidence': best_match.get('confidence', 0),
                     'overlap_ratio': max_overlap
                 }
@@ -4787,13 +5549,10 @@ class EnhancedCVOCRManager:
             x1, y1, x2, y2 = bbox1
             x3, y3, x4, y4 = bbox2
             
-            ix1 = max(x1, x3)
-            iy1 = max(y1, y3)
-            ix2 = min(x2, x4)
-            iy2 = min(y2, y4)
+            ix1, iy1 = max(x1, x3), max(y1, y3)
+            ix2, iy2 = min(x2, x4), min(y2, y4)
             
-            if ix2 <= ix1 or iy2 <= iy1:
-                return 0.0
+            if ix2 <= ix1 or iy2 <= iy1: return 0.0
             
             intersection = (ix2 - ix1) * (iy2 - iy1)
             area1 = (x2 - x1) * (y2 - y1)
@@ -4810,23 +5569,15 @@ class EnhancedCVOCRManager:
         if not results or not results.get('text_blocks'):
             return f"CVOCR文本识别完成但未找到文本 (耗时: {processing_time:.2f}秒)"
         
-        total_blocks = results.get('total_blocks', 0)
-        total_chars = results.get('total_characters', 0)
-        avg_confidence = results.get('average_confidence', 0)
+        total_blocks, total_chars, avg_confidence = results.get('total_blocks', 0), results.get('total_characters', 0), results.get('average_confidence', 0)
         
         components = results.get('cvocr_components', {})
-        used_components = []
-        if components.get('tesseract_used', False): used_components.append('Tesseract')
-        if components.get('fsrcnn_used', False): used_components.append('FSRCNN')
-        if components.get('layoutlmv2_used', False): used_components.append('LayoutLMv2')
-        if components.get('gpt_neo_used', False): used_components.append('GPT-Neo')
-        if components.get('transformer_ocr_used', False): used_components.append('TransformerOCR')
+        used_components = [comp.replace('_used', '').upper() for comp, used in components.items() if used and comp != 'fsrcnn_used']
         
         components_str = '+'.join(used_components) if used_components else 'Basic'
         
-        summary = f"CVOCR识别完成 [{components_str}] (耗时: {processing_time:.2f}s, {total_blocks}个文本块, {total_chars}个字符, 平均置信度: {avg_confidence:.1f})"
+        summary = f"CVOCR识别完成 [{components_str}] (耗时: {processing_time:.2f}s, {total_blocks}个块, {total_chars}个字符, 平均置信度: {avg_confidence:.1f}%)"
         
-        # preprocessing_info 来自 AdvancedTextImageProcessor 返回的message
         if preprocessing_info:
             summary += f", 预处理: {preprocessing_info.rstrip('; ')}"
         
@@ -4836,8 +5587,7 @@ class EnhancedCVOCRManager:
         """更新成功统计"""
         self.performance_stats['successful_recognitions'] += 1
         self.performance_stats['recognition_times'].append(processing_time)
-        if self.performance_stats['recognition_times']:
-            self.performance_stats['average_recognition_time'] = np.mean(self.performance_stats['recognition_times'])
+        self.performance_stats['average_recognition_time'] = np.mean(self.performance_stats['recognition_times'])
     
     def _update_failed_stats(self):
         """更新失败统计"""
@@ -4850,13 +5600,12 @@ class EnhancedCVOCRManager:
     def clear_performance_stats(self):
         """清除性能统计"""
         self.performance_stats = {
-            'total_recognitions': 0,
-            'successful_recognitions': 0,
-            'failed_recognitions': 0,
-            'average_recognition_time': 0.0,
-            'recognition_times': deque(maxlen=100),
-            'component_usage': defaultdict(int) # 重置为defaultdict
+            'total_recognitions': 0, 'successful_recognitions': 0, 'failed_recognitions': 0,
+            'average_recognition_time': 0.0, 'recognition_times': deque(maxlen=100),
+            'component_usage': defaultdict(int)
         }
+
+
 class AsyncOCRProcessor:
     def __init__(self, cvocr_manager: 'EnhancedCVOCRManager', max_workers: int = 4):
         self.cvocr_manager = cvocr_manager
@@ -4865,20 +5614,23 @@ class AsyncOCRProcessor:
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="AsyncOCR")
         logger.info(f"AsyncOCRProcessor initialized with ThreadPoolExecutor (max_workers={max_workers})")
 
-    async def run_blocking_ocr_task(self, image_path: str, enable_preprocessing: bool, precision_override: Optional[OCRPrecisionLevel]) -> Tuple[Optional[Dict], str]:
+    async def run_blocking_ocr_task(self, image_path: str, enable_preprocessing: bool) -> Tuple[Optional[Dict], str]:
         """
-        在单独的线程中运行阻塞的 OCR 识别任务。
-        """
-        loop = asyncio.get_running_loop()
+        在后台线程池中异步执行阻塞的OCR识别任务。
         
-        # 将 cvocr_manager.recognize_text_enhanced 视为一个阻塞函数
-        # 使用 loop.run_in_executor 将其调度到线程池中执行
+        此方法被修正以解决 'NameError: name 'loop' is not defined' 的问题。
+        """
+        # --- 关键修正：获取当前正在运行的 asyncio 事件循环 ---
+        # 原始代码中缺少这一行，导致了 NameError。
+        loop = asyncio.get_running_loop()
+        # --- 修正结束 ---
+
+        # 现在 'loop' 变量已定义，可以安全地使用它来调度任务
         return await loop.run_in_executor(
             self.executor,
             self.cvocr_manager.recognize_text_enhanced,
             image_path,
-            enable_preprocessing,
-            precision_override
+            enable_preprocessing
         )
     
     def shutdown(self):
@@ -4928,8 +5680,8 @@ class TextTestImageGenerator:
                      font=fonts[32], fill='black')
             y_pos += 60
             
-            # 技术架构说明
-            draw.text((50, y_pos), "技术架构: FSRCNN + LayoutLMv2 + Tesseract + GPT-Neo + TransformerOCR", 
+            # ### 修正：从技术架构描述中移除已被淘汰的 FSRCNN ###
+            draw.text((50, y_pos), "技术架构: PP-OCRv3 + LayoutLMv2 + Tesseract + GPT-Neo + TransformerOCR", 
                      font=fonts[20], fill='darkblue')
             y_pos += 40
             
@@ -4979,15 +5731,16 @@ class TextTestImageGenerator:
                 draw.text((50, y_pos), "表格测试：", font=fonts[20], fill='black')
                 y_pos += 35
                 
+                # 修正后
                 table_data = [
                     ["组件名称", "版本", "功能", "状态"],
                     ["Tesseract", "5.3+", "基础OCR", "✓"],
-                    ["FSRCNN", "2.0", "超分辨率", "✓"],
                     ["LayoutLMv2", "Base", "布局分析", "✓"],
                     ["GPT-Neo", "125M", "上下文分析", "✓"],
-                    ["TransformerOCR", "Base", "端到端OCR", "✓"]
+                    ["TransformerOCR", "Base", "端到端OCR", "✓"],
+                    ["PP-OCRv3", "v3.0", "文本检测", "✓"] # 可选添加
                 ]
-                
+                                
                 cell_width = 120
                 cell_height = 25
                 
@@ -5067,7 +5820,6 @@ class TextTestImageGenerator:
         except Exception as e:
             logger.error(f"生成测试图像失败: {traceback.format_exc()}")
             return False, f"生成测试图像失败: {str(e)}"
-
 class TextResultManager:
     """文本结果管理器
     负责存储、检索、管理和导出OCR识别的历史结果。
@@ -5101,60 +5853,40 @@ class TextResultManager:
     def add_result(self, image_path: str, results: Dict, metadata: Optional[Dict] = None) -> Optional[Dict]:
         """
         添加文本识别结果到历史记录。
-        此方法会确保将结果字典中的所有枚举类型（如OCRPrecisionLevel）转换为其字符串值，
-        使其能够被JSON序列化，方便后续保存和导出。
-        
-        Args:
-            image_path (str): 识别图像的完整路径。
-            results (Dict): OCR引擎返回的原始识别结果字典。
-            metadata (Optional[Dict]): 与识别过程相关的额外元数据，如处理时间。
-            
-        Returns:
-            Optional[Dict]: 添加到历史记录的条目字典，如果失败则返回None。
         """
         try:
-            # 确保枚举类型转换为其值 (字符串)，以便JSON序列化
-            # 对 results 字典进行深度拷贝，并递归转换其中的枚举类型
             serializable_results = self._make_results_json_serializable(results)
             
-            # 构建历史记录条目
             result_entry = {
-                'id': self._generate_result_id(), # 唯一识别ID
-                'timestamp': datetime.now().isoformat(), # 识别时间戳
+                'id': self._generate_result_id(),
+                'timestamp': datetime.now().isoformat(),
                 'image_path': image_path,
-                'image_name': os.path.basename(image_path), # 文件名
-                'results': serializable_results, # 存储已JSON序列化的结果
-                'metadata': metadata or {}, # 额外元数据
-                'total_blocks': serializable_results.get('total_blocks', 0), # 文本块总数
-                'total_characters': serializable_results.get('total_characters', 0), # 字符总数
-                'avg_confidence': serializable_results.get('average_confidence', 0), # 平均置信度
-                'full_text': serializable_results.get('full_text', ''), # 完整的识别文本
-                'precision_level': serializable_results.get('precision_level', 'unknown'), # 精度等级
-                'language': serializable_results.get('language', 'unknown'), # 识别语言
-                'cvocr_components': serializable_results.get('cvocr_components', {}), # 使用的CVOCR组件
-                'processing_time': metadata.get('total_processing_time', 0) if metadata else 0 # 总处理时间
+                'image_name': os.path.basename(image_path),
+                'results': serializable_results,
+                'metadata': metadata or {},
+                'total_blocks': serializable_results.get('total_blocks', 0),
+                'total_characters': serializable_results.get('total_characters', 0),
+                'avg_confidence': serializable_results.get('average_confidence', 0),
+                'full_text': serializable_results.get('full_text', ''),
+                'language': serializable_results.get('language', 'unknown'),
+                'cvocr_components': serializable_results.get('cvocr_components', {}),
+                'processing_time': metadata.get('total_processing_time', 0) if metadata else 0
             }
             
-            # 将新结果添加到历史记录列表的头部
             self.history.insert(0, result_entry)
             
-            # 维护历史记录列表的长度，超出最大限制则移除最旧的记录
             if len(self.history) > self.max_history:
                 removed_entries = self.history[self.max_history:]
                 self.history = self.history[:self.max_history]
                 
-                # 从内部缓存中删除已移除的条目
                 for entry_to_remove in removed_entries:
                     self._results_cache.pop(entry_to_remove['id'], None)
                 logger.debug(f"历史记录超出 {self.max_history} 条，已移除 {len(removed_entries)} 条最旧记录。")
             
-            # 更新当前结果引用
             self.current_results = serializable_results
             
-            # 更新全局统计信息
             self._update_stats(result_entry)
             
-            # 将结果条目缓存起来，以便通过ID快速检索
             self._results_cache[result_entry['id']] = result_entry
             
             logger.info(f"成功添加识别结果到历史记录: {result_entry['image_name']}。")
@@ -5164,7 +5896,6 @@ class TextResultManager:
         except Exception as e:
             logger.error(f"添加结果到历史记录失败: {e}\n{traceback.format_exc()}")
             return None
-
     def _make_results_json_serializable(self, data: Union[Dict, List, Any]) -> Union[Dict, List, Any]:
         """
         递归地将字典、列表或直接的枚举对象转换为可JSON序列化的形式。
@@ -5408,16 +6139,17 @@ class TextResultManager:
                 with open(filename, 'w', newline='', encoding='utf-8-sig') as f: # 使用utf-8-sig支持Excel
                     writer = csv.writer(f)
                     
-                    # 写入CSV表头
+                    # 【核心修正1】: 从CSV表头中移除“精度等级”
                     writer.writerow([
                         '时间', '图片名称', '文本块数', '字符数', '平均置信度', 
-                        '语言', '精度等级', '使用组件', '处理时间', '错误信息'
+                        '语言', '使用组件', '处理时间', '错误信息'
                     ])
                     
                     # 逐行写入历史记录数据
                     for entry in self.history:
                         components = entry.get('cvocr_components', {})
                         used_components = [k for k, v in components.items() if v] # 获取已使用的组件列表
+                        
                         
                         writer.writerow([
                             entry.get('timestamp', ''),
@@ -5426,7 +6158,6 @@ class TextResultManager:
                             entry.get('total_characters', 0),
                             f"{entry.get('avg_confidence', 0):.1f}", # 格式化置信度
                             entry.get('language', ''),
-                            entry.get('precision_level', ''),
                             '+'.join(used_components), # 将组件列表转换为字符串
                             f"{entry.get('processing_time', 0):.2f}s", # 格式化处理时间
                             entry.get('results', {}).get('error', '') # 如果有错误信息
@@ -5441,12 +6172,48 @@ class TextResultManager:
         except Exception as e:
             logger.error(f"导出历史记录失败: {traceback.format_exc()}")
             return False, f"导出失败: {str(e)}"
+class Tooltip:
+    """
+    创建一个可以附加到任何Tkinter控件的工具提示。
+    """
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
 
+    def show_tooltip(self, event=None):
+        x, y, _, _ = self.widget.bbox("insert")
+        x += self.widget.winfo_rootx() + 25
+        y += self.widget.winfo_rooty() + 25
+
+        self.tooltip_window = tk.Toplevel(self.widget)
+        self.tooltip_window.wm_overrideredirect(True)
+        self.tooltip_window.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(self.tooltip_window, text=self.text, justify='left',
+                         background="#ffffe0", relief='solid', borderwidth=1,
+                         wraplength=300,  # 提示框最大宽度
+                         font=("Arial", 10, "normal"))
+        label.pack(ipadx=5, ipady=5)
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
 class EnhancedCVOCRGUI:
     """增强版CVOCR GUI主界面"""
     
     def __init__(self, master: Optional[tk.Tk] = None):
-        # 初始化窗口
+        """
+        增强版CVOCR GUI主界面的构造函数 (V4.8 - 最终配置与状态版)。
+        负责初始化窗口、所有后端管理器、GUI状态变量，并定义了所有与UI控件绑定的Tkinter变量。
+        这是整个应用程序所有用户可配置状态的“单一事实来源”。
+        """
+        # ======================================================================
+        # 1. 窗口和基础设置
+        # ======================================================================
         if master is None:
             self.root = tk.Tk()
             self._is_standalone = True
@@ -5456,15 +6223,20 @@ class EnhancedCVOCRGUI:
 
         self.setup_window()
         
-        # 使用增强版组件
-        self.cvocr_manager = EnhancedCVOCRManager()
+        # ======================================================================
+        # 2. 初始化后端核心组件
+        # ======================================================================
+        # 使用增强版组件，并传入self.log_message作为日志回调函数
+        self.cvocr_manager = EnhancedCVOCRManager(logger_func=self.log_message)
         self.image_processor = AdvancedTextImageProcessor()
         self.result_manager = TextResultManager()
         
         # 引入异步 OCR 处理器
         self.async_ocr_processor = AsyncOCRProcessor(self.cvocr_manager)
 
-        # 界面变量
+        # ======================================================================
+        # 3. 初始化GUI状态变量
+        # ======================================================================
         self.current_image_path: Optional[str] = None
         self.processing = False
         self.photo = None
@@ -5473,116 +6245,177 @@ class EnhancedCVOCRGUI:
         self._last_original_image_size: Optional[Tuple[int, int]] = None
         self._last_display_scale_ratio_x: float = 1.0
         self._last_display_scale_ratio_y: float = 1.0
+        self._last_display_x_offset: int = 0
+        self._last_display_y_offset: int = 0
+        self._is_closing = False
+        self._cached_preprocessed_image: Optional[np.ndarray] = None
 
-        # 线程安全队列 (日志仍使用同步队列，但处理逻辑将在asyncio循环中被调度)
+        # ======================================================================
+        # 4. 设置线程安全队列和异步事件循环
+        # ======================================================================
         self.log_queue = queue.Queue()
-
-        # asyncio 事件循环
-        self.loop = None # 将在 start_async_loop_in_thread 中初始化
-        # --- 修正1: 添加事件用于同步异步循环的启动 ---
+        self.loop = None
         self._loop_ready_event = threading.Event()
 
-        # 设置选项
+        # ======================================================================
+        # 5. 定义所有Tkinter变量以绑定GUI控件
+        # ======================================================================
         self.settings = {
+            # --- OCR与检测核心配置 ---
+            
             'language': tk.StringVar(value='auto'),
-            'precision_level': tk.StringVar(value='balanced'),
-            'enable_preprocessing': tk.BooleanVar(value=True),
-            'save_results': tk.BooleanVar(value=True),
-            'confidence_threshold': tk.DoubleVar(value=CVOCRConstants.DEFAULT_CONFIDENCE_THRESHOLD),
-            'psm_mode': tk.IntVar(value=6),
-            'enable_layout_analysis': tk.BooleanVar(value=False),
-            'enable_context_analysis': tk.BooleanVar(value=False),
-            'enable_super_resolution': tk.BooleanVar(value=False),
-            'enable_transformer_ocr': tk.BooleanVar(value=False),
-            'show_confidence': tk.BooleanVar(value=True),
-            'auto_correct': tk.BooleanVar(value=False),
-            'use_gpu': tk.BooleanVar(value=False),
-            'batch_processing': tk.BooleanVar(value=False),
-            'auto_save_results': tk.BooleanVar(value=True),
-            'enable_advanced_preprocessing': tk.BooleanVar(value=True),
             'tesseract_path': tk.StringVar(value=''),
+            'confidence_threshold': tk.DoubleVar(value=CVOCRConstants.DEFAULT_CONFIDENCE_THRESHOLD),
+            'psm_mode': tk.StringVar(value='6: 假设为单个统一的文本块'),
+            'enable_advanced_segmentation': tk.BooleanVar(value=False),
+            'ppocr_model': tk.StringVar(value='text_detection_cn_ppocrv3_2023may.onnx'),
+            'yolo_weights_path': tk.StringVar(value='yolov4-tiny.weights'),
+            'yolo_cfg_path': tk.StringVar(value='yolov4-tiny.cfg'),
+            'yolo_names_path': tk.StringVar(value='coco.names'),
+            
+            # --- AI组件配置 ---
+            'enable_layout_analysis': tk.BooleanVar(value=False),
+            'layoutlm_model': tk.StringVar(value='microsoft/layoutlmv2-base-uncased'),
+            'enable_context_analysis': tk.BooleanVar(value=False),
+            'gpt_neo_model': tk.StringVar(value='EleutherAI/gpt-neo-125M'),
+            'enable_transformer_ocr': tk.BooleanVar(value=False),
+            'transformer_ocr_model': tk.StringVar(value='microsoft/trocr-base-printed'),
+            
+            # --- 文本块识别引擎 ---
+            'segmentation_recognizer': tk.StringVar(value='Tesseract'),
+            'enable_tesseract_fine_tuning': tk.BooleanVar(value=True),
+            
+            # --- 高级文本分割技术 ---
+            'seg_simple_high_contrast': tk.BooleanVar(value=True),
+            'seg_improved_mser': tk.BooleanVar(value=True),
+            'seg_multiscale_contour': tk.BooleanVar(value=True),
+            'seg_gradient_based': tk.BooleanVar(value=False),
+            'seg_multilevel_mser': tk.BooleanVar(value=False),
+            'seg_stroke_width_transform': tk.BooleanVar(value=False),
+            'seg_connected_components': tk.BooleanVar(value=False),
+            'seg_character_level': tk.BooleanVar(value=False),
+            'enable_smart_line_merge': tk.BooleanVar(value=True),
+            'enable_layoutlm_merge': tk.BooleanVar(value=False),
+            
+            # --- 图像预处理总开关 ---
+            'enable_preprocessing': tk.BooleanVar(value=True),
+            
+            # --- 核心转换步骤 ---
+            'enable_grayscale': tk.BooleanVar(value=True),
+            'enable_binarization': tk.BooleanVar(value=True),
+            'adaptive_block_size': tk.IntVar(value=11), 
+            'adaptive_c_constant': tk.IntVar(value=2), 
+            
+            # --- 几何校正 ---
             'enable_deskew': tk.BooleanVar(value=True),
             'deskew_angle_threshold': tk.DoubleVar(value=0.5),
             'remove_borders': tk.BooleanVar(value=True),
             'border_threshold': tk.IntVar(value=10),
             'crop_to_content': tk.BooleanVar(value=True),
             'page_border_detection': tk.BooleanVar(value=True),
+            
+            # --- 图像增强与降噪 ---
             'shadow_removal': tk.BooleanVar(value=True),
-            'denoise_strength': tk.DoubleVar(value=0.1),
-            'edge_preservation': tk.DoubleVar(value=0.8),
-            'unsharp_mask': tk.BooleanVar(value=True),
-            'unsharp_radius': tk.DoubleVar(value=1.0),
-            'unsharp_amount': tk.DoubleVar(value=1.0),
-            'histogram_equalization': tk.BooleanVar(value=True),
             'bilateral_filter': tk.BooleanVar(value=True), 
             'bilateral_d': tk.IntVar(value=9),
             'bilateral_sigma_color': tk.DoubleVar(value=75.0),
             'bilateral_sigma_space': tk.DoubleVar(value=75.0),
+            'histogram_equalization': tk.BooleanVar(value=True),
             'apply_clahe': tk.BooleanVar(value=True), 
             'clahe_clip_limit': tk.DoubleVar(value=2.0),
             'clahe_tile_grid_size_x': tk.IntVar(value=8), 
             'clahe_tile_grid_size_y': tk.IntVar(value=8), 
-            'adaptive_block_size': tk.IntVar(value=11), 
-            'adaptive_c_constant': tk.IntVar(value=2), 
-            # --- 新增开始 ---
-            'enable_advanced_segmentation': tk.BooleanVar(value=True),  # 默认开启高级分割
-            'segmentation_precision': tk.StringVar(value='balanced'),  # 默认平衡精度
-
-
+            'unsharp_mask': tk.BooleanVar(value=True),
+            'unsharp_radius': tk.DoubleVar(value=1.0),
+            'unsharp_amount': tk.DoubleVar(value=1.0),
+            
+            # --- 显示与保存 ---
+            'save_results': tk.BooleanVar(value=True),
+            'show_confidence': tk.BooleanVar(value=True),
+            'auto_save_results': tk.BooleanVar(value=True),
+            
+            # --- 性能 ---
+            'use_gpu': tk.BooleanVar(value=False),
+            'batch_processing': tk.BooleanVar(value=False)
         }
         
-        # 创建界面
+        # ======================================================================
+        # 6. 创建GUI界面
+        # ======================================================================
         self.create_widgets()
         self.create_status_bar()
         
-        # 初始化
+        # ======================================================================
+        # 7. 启动和初始化流程
+        # ======================================================================
         self.log_message("🚀 CVOCR增强版v3.0启动成功", 'INFO')
         self.log_message("✨ 新功能：多语言识别、高级预处理、智能文本分析", 'INFO')
-        self.log_message("🔧 CVOCR技术架构：FSRCNN + LayoutLMv2 + Tesseract + GPT-Neo + TransformerOCR", 'INFO')
+        self.log_message("🔧 CVOCR技术架构：PP-OCRv3 + LayoutLMv2 + Tesseract + GPT-Neo + Transformer OCR", 'INFO')
         
-        # 加载配置
         self._load_settings()
 
-        # 启动 asyncio 事件循环在一个单独的线程中
         self._start_async_loop_in_thread()
         
-        # --- 修正2: 等待异步循环中的 self.loop 初始化完成 ---
         self._loop_ready_event.wait()
 
-        # 启动日志处理和系统检查
-        # _process_queues 现在将由 asyncio loop 调度
         self.loop.call_soon_threadsafe(self.loop.create_task, self._process_queues())
         self.loop.call_soon_threadsafe(self.loop.create_task, self._trigger_initial_system_check_async())
 
-        # --- 新增：确认 BooleanVar 默认值 ---
         for key, var in self.settings.items():
             if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)):
                 logger.debug(f"DEBUG: Setting '{key}' initial value: {var.get()}")
-        # --- 新增结束 ---
         
-        # 启动调试监控（可选，建议在调试时启用）
         try:
             self.add_debug_monitoring()
         except Exception as e:
             logger.warning(f"启动调试监控失败: {e}")
-
     def _start_async_loop_in_thread(self):
         """在一个单独的线程中启动 asyncio 事件循环"""
         def run_loop():
+            # 为这个新线程创建一个全新的 asyncio 事件循环
             self.loop = asyncio.new_event_loop()
+            # 将这个新创建的循环设置为当前线程的事件循环
             asyncio.set_event_loop(self.loop)
-            # --- 修正3: 循环创建后设置事件，通知主线程 loop 已就绪 ---
+            
+            # --- 修正: 循环创建后设置事件，通知主线程 loop 已就绪 ---
+            # 这是关键的同步步骤。一旦 self.loop 被赋值，就立即设置事件。
+            # 这将释放主线程中正在等待的 .wait() 调用，使其可以安全地使用 self.loop。
             self._loop_ready_event.set()
-            self.loop.run_forever()
+            
+            # 启动事件循环，它将一直运行，直到被显式停止（例如在 on_closing 方法中）
+            try:
+                self.loop.run_forever()
+            finally:
+                # 当循环结束时（通常在程序退出时），确保它被正确关闭
+                # 获取所有正在运行的任务并取消它们
+                tasks = asyncio.all_tasks(loop=self.loop)
+                for task in tasks:
+                    task.cancel()
+                
+                # 收集所有任务的取消结果
+                async def gather_tasks():
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
-        self.async_loop_thread = threading.Thread(target=run_loop, daemon=True)
+                # 在循环中运行任务收集，直到完成
+                self.loop.run_until_complete(gather_tasks())
+                self.loop.close()
+                logger.info("Asyncio event loop has been properly shut down.")
+
+        # 创建一个新的守护线程来运行 run_loop 函数。
+        # 设置为守护线程 (daemon=True) 意味着如果主程序退出，这个线程也会被强制终止。
+        self.async_loop_thread = threading.Thread(target=run_loop, daemon=True, name="AsyncioEventLoopThread")
+        
+        # 启动后台线程
         self.async_loop_thread.start()
+        
+        # 记录日志，表示后台循环线程已启动
         logger.info("Asyncio event loop started in a separate thread.")
 
-
+    
     def setup_window(self):
         """设置窗口"""
-        self.root.title(f"CVOCR增强版v{CVOCRConstants.VERSION} - 高精度文本识别 (FSRCNN+LayoutLMv2+Tesseract+GPT-Neo+TransformerOCR)")
+        # ### 修正：从窗口标题中移除已被淘汰的 FSRCNN ###
+        self.root.title(f"CVOCR增强版v{CVOCRConstants.VERSION} - 高精度文本识别 (PP-OCRv3+LayoutLMv2+Tesseract+GPT-Neo+TransformerOCR)  作者：跳舞的火公子")
         self.root.geometry("1800x1200")
         self.root.minsize(1600, 1000)
         
@@ -5614,7 +6447,71 @@ class EnhancedCVOCRGUI:
         
         # 右侧显示区域
         self.create_display_area(main_frame)
-   
+    def _create_segmentation_techniques_section(self):
+        """
+        创建高级文本分割技术选择区 (V2 - LayoutLMv2集成版)
+        - 在“智能行合并”下增加“使用LayoutLMv2进行语义合并”的子选项，
+          为用户提供几何合并与语义合并两种模式的选择。
+        - 增强了Tooltip提示，以清晰地解释每个选项的功能和适用场景。
+        """
+        # --- 主容器 ---
+        seg_frame = ttk.LabelFrame(self.inner_control_frame, text="高级文本分割技术", padding=design.get_spacing('3'))
+        seg_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
+        
+        # --- 功能描述标签 ---
+        desc_label = ttk.Label(seg_frame, text="自由组合检测算法以适应不同图像。选择引擎精度预设可自动配置。", 
+                               font=design.get_font('xs'), foreground='gray', wraplength=380, justify='left')
+        desc_label.pack(anchor='w', pady=(0, design.get_spacing('2')))
+
+        # --- 定义所有可用的分割技术及其描述 ---
+        techniques = [
+            ('seg_simple_high_contrast', '高对比度轮廓 (快, 适用于清晰文档)'),
+            ('seg_improved_mser', '改进MSER (通用, 鲁棒)'),
+            ('seg_multiscale_contour', '多尺度轮廓 (适合多尺寸文本)'),
+            ('seg_gradient_based', '梯度检测 (适合边缘模糊文本)'),
+            ('seg_multilevel_mser', '多级MSER (极精确, 耗时)'),
+            ('seg_stroke_width_transform', '笔画宽度变换 (SWT, 复杂场景)'),
+            ('seg_connected_components', '连通分量分析 (字符级, 精细)'),
+            ('seg_character_level', '字符级分割 (实验性, 耗时)')
+        ]
+
+        # --- 循环创建技术选择的复选框 ---
+        for var_name, text in techniques:
+            ttk.Checkbutton(seg_frame, text=text,
+                            variable=self.settings[var_name], style='TCheckbutton').pack(anchor='w')
+
+        # --- 分隔线 ---
+        ttk.Separator(seg_frame, orient='horizontal').pack(fill='x', pady=design.get_spacing('2'), padx=design.get_spacing('1'))
+        
+        # --- 智能行合并控制区域 ---
+        merge_control_frame = ttk.Frame(seg_frame)
+        merge_control_frame.pack(fill='x', pady=(design.get_spacing('1'), 0))
+
+        # “启用智能行合并” 主开关
+        merge_check = ttk.Checkbutton(merge_control_frame, text="启用智能行合并",
+                                      variable=self.settings['enable_smart_line_merge'])
+        merge_check.pack(side='left', anchor='w')
+        Tooltip(merge_check, "将检测到的相邻小文本块合并成更完整的逻辑单元（行、段落等）。\n这是所有合并功能的主开关。")
+        
+        # “预览合并效果” 按钮
+        btn_preview_merge = tk.Button(merge_control_frame, text="🔬 预览合并效果", command=self.preview_merge_effect)
+        design.apply_button_style(btn_preview_merge, 'secondary')
+        btn_preview_merge.pack(side='left', padx=(design.get_spacing('2'), 0))
+        Tooltip(btn_preview_merge, "预览启用此功能前后的分割框对比效果。")
+
+        # --- 新增：LayoutLMv2 语义合并选项 ---
+        # 使用一个新的框架并进行缩进，以在视觉上表示层级关系
+        layoutlm_merge_frame = ttk.Frame(seg_frame)
+        layoutlm_merge_frame.pack(fill='x', padx=(20, 0))
+
+        # “使用LayoutLMv2进行语义合并” 子选项
+        layoutlm_merge_check = ttk.Checkbutton(layoutlm_merge_frame, text="🧠 使用LayoutLMv2进行语义合并 (精度最高)",
+                                               variable=self.settings['enable_layoutlm_merge'])
+        layoutlm_merge_check.pack(anchor='w')
+        Tooltip(layoutlm_merge_check, ("需要已初始化LayoutLMv2模型。\n"
+                                       "启用后，将使用深度学习模型分析文档结构（段落、列表、表格），"
+                                       "实现最智能的合并，能处理多栏、图文混排等复杂布局。\n"
+                                       "【注意】会显著增加处理时间！"))
     def create_enhanced_control_panel(self, parent):
         """创建增强控制面板"""
         # 创建外层容器
@@ -5656,6 +6553,9 @@ class EnhancedCVOCRGUI:
         
         # OCR配置区
         self._create_ocr_configuration_section()
+
+        # --- 新增调用 ---
+        self._create_segmentation_techniques_section()
         
         # 图像操作区
         self._create_image_operations_section()
@@ -5696,142 +6596,370 @@ class EnhancedCVOCRGUI:
         version_label.pack(pady=design.get_spacing('1'))
     
     def _create_cvocr_components_section(self):
-        """创建CVOCR组件配置区"""
+        """
+        创建CVOCR组件配置区 (V3.30 - 统一模型选择与状态反馈版)
+        - 为所有主要的AI组件（LayoutLMv2, GPT-Neo, Transformer OCR）提供统一的配置UI。
+        - 每个组件都包含：启用开关、功能描述、模型选择下拉框和状态反馈标签。
+        - 模型列表可以从外部配置文件加载，增加了灵活性（此处为简化，仍硬编码）。
+        """
         components_frame = ttk.LabelFrame(self.inner_control_frame, text="CVOCR组件配置", padding=design.get_spacing('3'))
         components_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
-        
-        # FSRCNN超分辨率
-        fsrcnn_frame = ttk.Frame(components_frame)
-        fsrcnn_frame.pack(fill='x', pady=design.get_spacing('1'))
-                
-        ttk.Checkbutton(fsrcnn_frame, text="🎯 启用FSRCNN超分辨率增强",
-                        variable=self.settings['enable_super_resolution'], 
-                        style='TCheckbutton').pack(anchor='w')
-        
-        fsrcnn_desc = ttk.Label(fsrcnn_frame, text="    提升图像分辨率，增强文本清晰度", 
-                               font=design.get_font('xs'), foreground='gray')
-        fsrcnn_desc.pack(anchor='w')
-        
-        # LayoutLMv2布局分析
-        layout_frame = ttk.Frame(components_frame)
-        layout_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        ttk.Checkbutton(layout_frame, text="📄 启用LayoutLMv2布局分析",
-                        variable=self.settings['enable_layout_analysis'], 
-                        style='TCheckbutton').pack(anchor='w')
-        
-        layout_desc = ttk.Label(layout_frame, text="    理解文档结构，提升复杂版面识别", 
-                               font=design.get_font('xs'), foreground='gray')
-        layout_desc.pack(anchor='w')
-        
-        # GPT-Neo上下文分析
-        context_frame = ttk.Frame(components_frame)
-        context_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        ttk.Checkbutton(context_frame, text="🧠 启用GPT-Neo上下文分析",
-                        variable=self.settings['enable_context_analysis'], 
-                        style='TCheckbutton').pack(anchor='w')
-        
-        context_desc = ttk.Label(context_frame, text="    智能文本纠错，提升识别准确度", 
-                                font=design.get_font('xs'), foreground='gray')
-        context_desc.pack(anchor='w')
-        
-        # Transformer OCR
-        transformer_frame = ttk.Frame(components_frame)
-        transformer_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        ttk.Checkbutton(transformer_frame, text="🤖 启用Transformer OCR",
-                        variable=self.settings['enable_transformer_ocr'], 
-                        style='TCheckbutton').pack(anchor='w')
-        
-        transformer_desc = ttk.Label(transformer_frame, text="    端到端深度学习文本识别", 
-                                    font=design.get_font('xs'), foreground='gray')
-        transformer_desc.pack(anchor='w')
+
+        # --- 统一的组件创建函数，以减少代码重复 ---
+        def create_component_widget(parent, check_var_name, check_text, desc_text,
+                                    model_var_name, model_list, tooltip_text):
+            
+            # 主框架
+            frame = ttk.Frame(parent)
+            frame.pack(fill='x', pady=design.get_spacing('2'))
+
+            # 启用复选框和描述
+            check_frame = ttk.Frame(frame)
+            check_frame.pack(fill='x')
+            checkbutton = ttk.Checkbutton(check_frame, text=check_text,
+                                          variable=self.settings[check_var_name],
+                                          style='TCheckbutton')
+            checkbutton.pack(anchor='w')
+            Tooltip(checkbutton, tooltip_text) # 为复选框添加提示
+
+            desc_label = ttk.Label(check_frame, text=desc_text,
+                                   font=design.get_font('xs'), foreground='gray')
+            desc_label.pack(anchor='w', padx=(20, 0)) # 缩进
+
+            # 模型选择和状态反馈
+            model_frame = ttk.Frame(frame)
+            model_frame.pack(fill='x', pady=(design.get_spacing('1'), 0), padx=(20, 0)) # 缩进
+
+            tk.Label(model_frame, text="模型选择:", bg=design.get_color('neutral', '50')).pack(side='left', padx=(0, design.get_spacing('2')))
+            
+            model_combo = ttk.Combobox(model_frame,
+                                       textvariable=self.settings[model_var_name],
+                                       values=model_list,
+                                       width=30,
+                                       state='readonly')
+            model_combo.pack(side='left', fill='x', expand=True)
+
+            # 创建并存储状态标签，以便后续更新
+            status_label = ttk.Label(model_frame, text="(未初始化)", foreground="gray", font=design.get_font('xs'))
+            status_label.pack(side='left', padx=(design.get_spacing('2'), 0))
+            
+            return status_label # 返回状态标签的引用
+
+        # --- 1. LayoutLMv2 布局分析 ---
+        layoutlm_models = [
+            'microsoft/layoutlmv2-base-uncased',
+            'microsoft/layoutlmv2-large-uncased' # 提供大模型选项
+        ]
+        self.layoutlm_status_label = create_component_widget(
+            components_frame,
+            check_var_name='enable_layout_analysis',
+            check_text="📄 启用LayoutLMv2布局分析",
+            desc_text="理解文档结构，提升表格、列表等复杂版面识别",
+            model_var_name='layoutlm_model', # 新增一个设置变量
+            model_list=layoutlm_models,
+            tooltip_text="分析页面元素的类型（如标题、段落、表格），为结构化输出提供依据。"
+        )
+        # 为新的设置变量初始化
+        if 'layoutlm_model' not in self.settings:
+            self.settings['layoutlm_model'] = tk.StringVar(value=layoutlm_models[0])
+
+        # --- 2. GPT-Neo 上下文分析 ---
+        gpt_neo_models = [
+            'EleutherAI/gpt-neo-125M',
+            'EleutherAI/gpt-neo-1.3B' # 提供更大、更强的模型选项
+        ]
+        self.gpt_neo_status_label = create_component_widget(
+            components_frame,
+            check_var_name='enable_context_analysis',
+            check_text="🧠 启用GPT-Neo上下文分析",
+            desc_text="智能文本纠错，优化语法和格式，提升识别准确度",
+            model_var_name='gpt_neo_model', # 新增一个设置变量
+            model_list=gpt_neo_models,
+            tooltip_text="利用大语言模型对OCR初步结果进行后处理，修正常见的识别错误。"
+        )
+        # 为新的设置变量初始化
+        if 'gpt_neo_model' not in self.settings:
+            self.settings['gpt_neo_model'] = tk.StringVar(value=gpt_neo_models[0])
+
+        # --- 3. Transformer OCR (整页模式) ---
+        trocr_models = [
+            'microsoft/trocr-base-printed',
+            'microsoft/trocr-base-handwritten',
+            'microsoft/trocr-small-printed',
+            'microsoft/trocr-large-printed', # 提供大模型选项
+            'google/trocr-base-zh-printed'
+        ]
+        self.trocr_status_label = create_component_widget(
+            components_frame,
+            check_var_name='enable_transformer_ocr',
+            check_text="🤖 启用Transformer OCR (整页模式)",
+            desc_text="端到端深度学习文本识别。不与高级分割/全元素检测同时使用。",
+            model_var_name='transformer_ocr_model',
+            model_list=trocr_models,
+            tooltip_text="直接从图像像素识别文本，适合无复杂布局的清晰图像。开启此项时，高级分割将被忽略。"
+        )
+    def _browse_for_yolo_file(self, setting_var: tk.StringVar, title: str, filetypes: List[Tuple[str, str]]):
+        """打开文件对话框以选择YOLO模型文件。"""
+        file_path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if file_path:
+            setting_var.set(file_path)
+            self.log_message(f"✅ 已选择{title}: {os.path.basename(file_path)}", "SUCCESS")
+    
+    
     
     def _create_ocr_configuration_section(self):
         """
-        创建OCR配置区，并集成高级文本分割设置。
-        这个区域允许用户配置所有与OCR识别过程相关的核心参数，
-        包括语言、Tesseract的引擎参数，以及新集成的高级分割引擎。
+        创建OCR配置区 (V4.7 - 增强引导与UI重构版)
+        - 完全暴露OEM和PSM参数，采用直接选择逻辑。
+        - 新增PSM帮助按钮和增强的Tooltip，引导用户做出正确选择。
+        - 重构检测模式与识别引擎的UI布局，使其更清晰、更具功能性。
         """
-        # 创建一个主容器 LabelFrame 用于所有OCR相关的配置
-        ocr_frame = ttk.LabelFrame(self.inner_control_frame, text="OCR配置", padding=design.get_spacing('3'))
+        # --- 主容器 ---
+        ocr_frame = ttk.LabelFrame(self.inner_control_frame, text="OCR与检测配置", padding=design.get_spacing('3'))
         ocr_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
         
-        # 1. 语言选择
+        # 1. 语言设置
         lang_frame = ttk.Frame(ocr_frame)
         lang_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        tk.Label(lang_frame, text="识别语言:", bg=design.get_color('neutral', '50')).pack(side='left')
+        lang_label = tk.Label(lang_frame, text="识别语言:", bg=design.get_color('neutral', '50'))
+        lang_label.pack(side='left', padx=(0, design.get_spacing('2')))
         lang_combo = ttk.Combobox(lang_frame, textvariable=self.settings['language'],
                                     values=['auto', 'chi_sim', 'eng', 'chi_tra', 'jpn', 'kor', 'chi_sim+eng'], 
                                     width=15, state='readonly')
-        lang_combo.pack(side='right')
-        
-        # 2. OCR引擎精度设置区
-        precision_frame = ttk.LabelFrame(ocr_frame, text="引擎精度设置", padding=design.get_spacing('2'))
-        precision_frame.pack(fill='x', pady=design.get_spacing('2'))
-        
-        precision_options = [
-            ('⚡ 快速模式', 'fast', '最快速度，牺牲部分精度'),
-            ('⚖️ 平衡模式', 'balanced', '平衡速度与精度，适用多数场景'),
-            ('🎯 精确模式', 'accurate', '高精度识别，处理时间较长'),
-            ('🏆 超精确模式', 'ultra', '最高精度，适合复杂或低质量文档')
-        ]
-        
-        # 循环创建精度选择的单选按钮及其描述
-        for text, value, desc in precision_options:
-            radio_frame = ttk.Frame(precision_frame)
-            radio_frame.pack(fill='x', pady=design.get_spacing('1'))
-            
-            ttk.Radiobutton(radio_frame, text=text, variable=self.settings['precision_level'],
-                            value=value, style='TRadiobutton').pack(anchor='w')
-            
-            desc_label = ttk.Label(radio_frame, text=f"    {desc}", 
-                                  font=design.get_font('xs'), foreground='gray')
-            desc_label.pack(anchor='w')
-        
-        # 3. Tesseract 核心参数区
+        lang_combo.pack(side='right', fill='x', expand=True)
+        Tooltip(lang_frame, "选择图片中包含的主要语言。\n'chi_sim+eng' 适合中英文混合的文档。")
+
+        # 2. Tesseract 核心参数
         params_frame = ttk.LabelFrame(ocr_frame, text="Tesseract 核心参数", padding=design.get_spacing('2'))
         params_frame.pack(fill='x', pady=design.get_spacing('2'))
         
-        # 置信度阈值
+        path_frame = ttk.Frame(params_frame)
+        path_frame.pack(fill='x', pady=design.get_spacing('1'), expand=True)
+        path_label = tk.Label(path_frame, text="Tesseract 路径:", bg=design.get_color('neutral', '50'))
+        path_label.pack(side='left')
+        path_entry = ttk.Entry(path_frame, textvariable=self.settings['tesseract_path'])
+        path_entry.pack(side='left', fill='x', expand=True, padx=(design.get_spacing('1'), design.get_spacing('1')))
+        browse_button = ttk.Button(path_frame, text="浏览...", command=self._browse_for_tesseract)
+        browse_button.pack(side='right')
+        Tooltip(path_frame, "设置Tesseract OCR引擎可执行文件(tesseract.exe)的路径。\n如果系统环境变量已配置，则可留空。")
+
         conf_frame = ttk.Frame(params_frame)
         conf_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        tk.Label(conf_frame, text="结果置信度阈值:", bg=design.get_color('neutral', '50')).pack(side='left')
-        conf_scale = ttk.Scale(params_frame, from_=0, to=100, 
-                                variable=self.settings['confidence_threshold'],
-                                orient='horizontal', length=120)
+        conf_label = tk.Label(conf_frame, text="结果置信度阈值:", bg=design.get_color('neutral', '50'))
+        conf_label.pack(side='left')
+        conf_scale = ttk.Scale(conf_frame, from_=0, to=100, variable=self.settings['confidence_threshold'], orient='horizontal', length=120)
         conf_scale.pack(side='right')
+        Tooltip(conf_frame, "过滤掉置信度低于此值的识别结果。\n调高可获得更准确但可能不完整的文本，调低则相反。建议60-85。")
         
-        # PSM模式
+        # --- 全新的 PSM (页面分割模式) UI ---
         psm_frame = ttk.Frame(params_frame)
         psm_frame.pack(fill='x', pady=design.get_spacing('1'))
+        psm_label = tk.Label(psm_frame, text="页面分割模式 (PSM):", bg=design.get_color('neutral', '50'))
+        psm_label.pack(side='left')
         
-        tk.Label(psm_frame, text="页面分割模式 (PSM):", bg=design.get_color('neutral', '50')).pack(side='left')
-        psm_entry = ttk.Entry(psm_frame, textvariable=self.settings['psm_mode'], width=10)
-        psm_entry.pack(side='right')
+        psm_help_button = tk.Button(psm_frame, text="?", command=self._show_psm_help, 
+                                    font=('Arial', 8, 'bold'), relief='flat', 
+                                    bg=design.get_color('neutral', '200'), 
+                                    activebackground=design.get_color('neutral', '300'))
+        psm_help_button.pack(side='right', padx=(5,0))
+        Tooltip(psm_help_button, "点击查看所有页面分割模式的详细解释。")
 
-        # 4. 【新增】高级文本分割设置区
-        # 这个新区域允许用户启用我们移植过来的高级分割引擎
-        seg_frame = ttk.LabelFrame(ocr_frame, text="高级文本分割设置 (替换Tesseract PSM)", padding=design.get_spacing('2'))
-        seg_frame.pack(fill='x', pady=design.get_spacing('2'), padx=design.get_spacing('1'))
+        psm_values = [
+            "0: 方向和脚本检测(OSD)", "1: 自动页面分割+OSD", "2: 自动页面分割(无OSD)",
+            "3: 全自动页面分割(默认)", "4: 假设为单列可变大小文本", "5: 假设为单个统一的垂直文本块",
+            "6: 假设为单个统一的文本块", "7: 将图像视为单行文本", "8: 将图像视为单个单词",
+            "9: 将图像视为圆圈内的单个单词", "10: 将图像视为单个字符",
+            "11: 稀疏文本", "12: 带OSD的稀疏文本", "13: 原始行(无分词等处理)"
+        ]
+        psm_combo = ttk.Combobox(psm_frame, textvariable=self.settings['psm_mode'], values=psm_values, state='readonly')
+        psm_combo.pack(side='right', fill='x', expand=True)
+        psm_combo.set("6: 假设为单个统一的文本块") #【重要】将默认值改为对分割后最友好的模式6
+        Tooltip(psm_frame, ("指导Tesseract如何分析页面布局。\n"
+                           "重要提示：在启用高级分割/全元素检测后，此设置将应用于【每个】被切割出的独立文本块。\n"
+                           "为获得最佳效果，强烈推荐选择区域级模式，如 6 或 7。"))
+
+        # --- 全新的 OEM (引擎模式) UI ---
+        oem_frame = ttk.LabelFrame(params_frame, text="OEM (引擎模式) - 可多选", padding=design.get_spacing('2'))
+        oem_frame.pack(fill='x', pady=design.get_spacing('2'))
         
-        # 启用/禁用 开关
-        ttk.Checkbutton(seg_frame, text="✨ 启用高级文本分割",
+        self.settings['oem_options'] = {
+            '0': tk.BooleanVar(value=False),
+            '1': tk.BooleanVar(value=False),
+            '2': tk.BooleanVar(value=False),
+            '3': tk.BooleanVar(value=True), # 默认勾选推荐的 OEM 3
+        }
+        
+        oem_defs = {
+            '0': ("经典引擎 (Legacy)", "速度最快，基于传统模式匹配，适合极清晰的打印体。"),
+            '1': ("神经网络 (LSTM)", "现代AI引擎，准确率高，但比经典引擎慢。"),
+            '2': ("经典 + LSTM", "组合两个引擎，速度最慢，用于实验性比较。"),
+            '3': ("默认 (推荐)", "智能选择LSTM引擎，是速度和准确率的最佳平衡点。")
+        }
+        
+        oem_info_label = ttk.Label(oem_frame, text="勾选要使用的识别引擎。若不选，将不指定OEM参数，由Tesseract决定。",
+                                   font=design.get_font('xs'), foreground='gray', wraplength=380)
+        oem_info_label.pack(anchor='w', pady=(0, design.get_spacing('2')))
+
+        checkbox_frame = ttk.Frame(oem_frame)
+        checkbox_frame.pack(fill='x')
+        for key, var in self.settings['oem_options'].items():
+            oem_check = ttk.Checkbutton(checkbox_frame, text=oem_defs[key][0], variable=var)
+            oem_check.pack(anchor='w') 
+            Tooltip(oem_check, oem_defs[key][1])
+            
+        # 3. 检测模式与引擎配置
+        detection_frame = ttk.LabelFrame(ocr_frame, text="检测模式与引擎", padding=design.get_spacing('2'))
+        detection_frame.pack(fill='x', pady=design.get_spacing('2'), padx=design.get_spacing('1'))
+        
+        yolo_checkbox = ttk.Checkbutton(detection_frame, text="✨ 启用全元素检测 (YOLO)",
                         variable=self.settings['enable_advanced_segmentation'], 
-                        style='TCheckbutton').pack(anchor='w', pady=(design.get_spacing('1'), 0))
+                        style='TCheckbutton')
+        yolo_checkbox.pack(anchor='w', pady=(design.get_spacing('1'), 0))
+        Tooltip(yolo_checkbox, "核心模式切换！\n"
+                               "▶ 勾选: 同时检测文本、表格和图形，适合复杂版面。\n"
+                               "▶ 不勾选: 仅进行纯文本OCR，速度更快，适合普通文档。")
         
-        # 分割精度选择
-        seg_precision_frame = ttk.Frame(seg_frame)
-        seg_precision_frame.pack(fill='x', pady=design.get_spacing('1'))
+        desc_label = ttk.Label(detection_frame, text="    勾选此项以检测图形和表格，否则仅进行纯文本OCR。", 
+                               font=design.get_font('xs'), foreground='gray', justify='left')
+        desc_label.pack(anchor='w', pady=(0, design.get_spacing('2')))
+
+        # A. 纯文本检测引擎 (默认模式) -> 不再需要，因为高级分割技术已经接管
         
-        tk.Label(seg_precision_frame, text="分割精度:", bg=design.get_color('neutral', '50')).pack(side='left')
-        seg_precision_combo = ttk.Combobox(seg_precision_frame, textvariable=self.settings['segmentation_precision'],
-                                          values=['fast', 'balanced', 'accurate', 'ultra'], 
-                                          width=12, state='readonly')
-        seg_precision_combo.pack(side='right')
+        # B. 全元素检测引擎 (YOLO)
+        yolo_frame = ttk.LabelFrame(detection_frame, text="全元素检测引擎 (YOLO)", padding=design.get_spacing('2'))
+        yolo_frame.pack(fill='x', pady=design.get_spacing('1'))
+        Tooltip(yolo_frame, "当'启用全元素检测'被勾选时使用此引擎。\n它是一个通用的对象检测器，能识别文本块、表格、图表等多种页面元素。")
+        
+        weights_row = ttk.Frame(yolo_frame)
+        weights_row.pack(fill='x', pady=2)
+        tk.Label(weights_row, text="权重 (.weights):", bg=design.get_color('neutral', '50'), width=15, anchor='w').pack(side='left')
+        weights_entry = ttk.Entry(weights_row, textvariable=self.settings['yolo_weights_path'])
+        weights_entry.pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(weights_row, text="浏览...", command=lambda: self._browse_for_yolo_file(
+            self.settings['yolo_weights_path'], "选择权重文件", [("Weights files", "*.weights"), ("All files", "*.*")])).pack(side='right')
+        Tooltip(weights_row, "YOLO模型的'大脑'，包含了所有通过训练学到的知识。")
+
+        cfg_row = ttk.Frame(yolo_frame)
+        cfg_row.pack(fill='x', pady=2)
+        tk.Label(cfg_row, text="配置 (.cfg):", bg=design.get_color('neutral', '50'), width=15, anchor='w').pack(side='left')
+        cfg_entry = ttk.Entry(cfg_row, textvariable=self.settings['yolo_cfg_path'])
+        cfg_entry.pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(cfg_row, text="浏览...", command=lambda: self._browse_for_yolo_file(
+            self.settings['yolo_cfg_path'], "选择配置文件", [("Config files", "*.cfg"), ("All files", "*.*")])).pack(side='right')
+        Tooltip(cfg_row, "YOLO模型的'蓝图'，定义了神经网络的结构。")
+
+        names_row = ttk.Frame(yolo_frame)
+        names_row.pack(fill='x', pady=2)
+        tk.Label(names_row, text="类别 (.names):", bg=design.get_color('neutral', '50'), width=15, anchor='w').pack(side='left')
+        names_entry = ttk.Entry(names_row, textvariable=self.settings['yolo_names_path'])
+        names_entry.pack(side='left', fill='x', expand=True, padx=5)
+        ttk.Button(names_row, text="浏览...", command=lambda: self._browse_for_yolo_file(
+            self.settings['yolo_names_path'], "选择类别文件", [("Names files", "*.names"), ("All files", "*.*")])).pack(side='right')
+        Tooltip(names_row, "一个简单的文本文件，列出了YOLO模型能够识别的所有对象名称。")
+        
+        # C. 文本块识别引擎
+        recognizer_frame = ttk.LabelFrame(ocr_frame, text="文本块识别引擎", padding=design.get_spacing('2'))
+        recognizer_frame.pack(fill='x', pady=design.get_spacing('1'))
+        
+        tesseract_row = ttk.Frame(recognizer_frame)
+        tesseract_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        
+        tess_radio = ttk.Radiobutton(tesseract_row, text="Tesseract", variable=self.settings['segmentation_recognizer'], value="Tesseract")
+        tess_radio.pack(side='left', padx=(0, design.get_spacing('2')))
+        
+        tess_fine_tune_check = ttk.Checkbutton(tesseract_row, text="启用精细化预处理", variable=self.settings['enable_tesseract_fine_tuning'])
+        tess_fine_tune_check.pack(side='left', padx=(0, design.get_spacing('2')))
+        Tooltip(tess_fine_tune_check, "对每个文本块进行缩放、增强、二值化等操作，通常能提升Tesseract识别率。")
+
+        btn_preview_region_proc = tk.Button(tesseract_row, text="🔬 预览", command=self.preview_region_preprocessing)
+        design.apply_button_style(btn_preview_region_proc, 'secondary')
+        btn_preview_region_proc.pack(side='left')
+        Tooltip(btn_preview_region_proc, "预览精细化预处理对单个文本区域的效果。")
+
+        trocr_row = ttk.Frame(recognizer_frame)
+        trocr_row.pack(fill='x', pady=(design.get_spacing('1'), 0))
+
+        trocr_radio = ttk.Radiobutton(trocr_row, text="TransformerOCR", variable=self.settings['segmentation_recognizer'], value="TransformerOCR")
+        trocr_radio.pack(side='left', padx=(0, design.get_spacing('2')))
+
+        trocr_models = [
+            'microsoft/trocr-base-printed',
+            'microsoft/trocr-base-handwritten',
+            'microsoft/trocr-large-printed',
+            'google/trocr-base-zh-printed'
+        ]
+        trocr_model_combo = ttk.Combobox(trocr_row, 
+                                         textvariable=self.settings['transformer_ocr_model'],
+                                         values=trocr_models, 
+                                         width=30, 
+                                         state='readonly')
+        trocr_model_combo.pack(side='left', fill='x', expand=True, padx=(0, design.get_spacing('1')))
+        
+        self.trocr_model_status_label = ttk.Label(trocr_row, text=" (未初始化)", foreground="gray")
+        self.trocr_model_status_label.pack(side='left')
+        
+        recognizer_desc = ttk.Label(recognizer_frame, text="选择用于识别已定位文本块的引擎。TransformerOCR精度更高，但需加载模型。", 
+                                   font=design.get_font('xs'), foreground='gray', justify='left', wraplength=350)
+        recognizer_desc.pack(anchor='w', pady=(design.get_spacing('2'), 0))
+    def _show_psm_help(self):
+        """创建一个新窗口，用表格详细解释所有PSM模式。"""
+        help_window = tk.Toplevel(self.root)
+        help_window.title("页面分割模式 (PSM) 详细说明")
+        help_window.geometry("700x550")
+        help_window.transient(self.root)
+        help_window.grab_set()
+
+        main_frame = ttk.Frame(help_window, padding=design.get_spacing('4'))
+        main_frame.pack(fill='both', expand=True)
+
+        title_label = tk.Label(main_frame, text="Tesseract 页面分割模式 (PSM)", bg=design.get_color('neutral', '50'))
+        design.apply_text_style(title_label, 'h3')
+        title_label.pack(anchor='w', pady=(0, design.get_spacing('2')))
+        
+        desc_label = tk.Label(main_frame, bg=design.get_color('neutral', '50'),
+                              text=("PSM指导Tesseract如何分析和分割页面布局。\n"
+                                    "在启用高级分割后，此设置将应用于【每一个】被切割出的独立文本块。\n"
+                                    "因此，选择正确的模式至关重要！"),
+                              wraplength=650, justify='left', font=design.get_font('body', family='primary'))
+        desc_label.pack(anchor='w', pady=(0, design.get_spacing('4')))
+
+        # 使用Treeview创建一个表格
+        columns = ('模式', '说明', '适用场景')
+        tree = ttk.Treeview(main_frame, columns=columns, show='headings', height=15)
+        
+        tree.heading('模式', text='模式 (值)')
+        tree.column('模式', width=100, anchor='center')
+        tree.heading('说明', text='说明')
+        tree.column('说明', width=300, anchor='w')
+        tree.heading('适用场景', text='推荐场景')
+        tree.column('适用场景', width=250, anchor='w')
+
+        full_psm_data = [
+            ("0", "方向和脚本检测 (OSD)", "仅用于检测文字方向和语言，不进行OCR。"),
+            ("1", "自动页面分割 + OSD", "【不推荐】用于已分割区域。"),
+            ("2", "自动页面分割 (无OSD)", "【不推荐】用于已分割区域。"),
+            ("3", "全自动页面分割 (默认)", "【不推荐】用于已分割区域。"),
+            ("4", "假设为单列可变大小文本", "【不推荐】用于已分割区域。"),
+            ("5", "假设为单个统一的垂直文本块", "【特定场景】用于垂直书写的文本块。"),
+            ("6", "假设为单个统一的文本块", "【强烈推荐】最通用的模式。"),
+            ("7", "将图像视为单行文本", "【推荐】用于单行文字。"),
+            ("8", "将图像视为单个单词", "【推荐】用于单个单词。"),
+            ("9", "将图像视为圆圈内的单个单词", "特定场景，如印章。"),
+            ("10", "将图像视为单个字符", "特定场景，如验证码。"),
+            ("11", "稀疏文本", "【不推荐】用于已分割区域。"),
+            ("12", "带OSD的稀疏文本", "【不推荐】用于已分割区域。"),
+            ("13", "原始行", "【推荐】用于序列号等。")
+        ]
+
+        for item in full_psm_data:
+            tree.insert('', 'end', values=item)
+
+        tree.pack(fill='both', expand=True)
+
+        close_button = tk.Button(main_frame, text="关闭", command=help_window.destroy)
+        design.apply_button_style(close_button, 'primary')
+        close_button.pack(pady=(design.get_spacing('4'), 0))
+    
     
     def _create_image_operations_section(self):
         """创建图像操作区"""
@@ -5842,6 +6970,16 @@ class EnhancedCVOCRGUI:
         design.apply_button_style(btn_select_image, 'secondary')
         btn_select_image.pack(fill='x', pady=design.get_spacing('1'))
 
+        btn_preview_process = tk.Button(image_frame, text="🔬 预览预处理", command=self.preview_preprocessing)
+        design.apply_button_style(btn_preview_process, 'primary')
+        btn_preview_process.pack(fill='x', pady=design.get_spacing('1'))
+
+        # --- 新增代码开始 ---
+        btn_preview_segmentation = tk.Button(image_frame, text="📊 预览分割结果", command=self.preview_segmentation)
+        design.apply_button_style(btn_preview_segmentation, 'primary')
+        btn_preview_segmentation.pack(fill='x', pady=design.get_spacing('1'))
+        # --- 新增代码结束 ---
+        
         btn_generate_test = tk.Button(image_frame, text="🎨 生成测试图片", command=self.generate_test_images)
         design.apply_button_style(btn_generate_test, 'secondary')
         btn_generate_test.pack(fill='x', pady=design.get_spacing('1'))
@@ -5855,172 +6993,279 @@ class EnhancedCVOCRGUI:
         recognition_frame = ttk.LabelFrame(self.inner_control_frame, text="文本识别", padding=design.get_spacing('3'))
         recognition_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
         
-        btn_start_recognition = tk.Button(recognition_frame, text="🚀 开始CVOCR识别", command=self.start_enhanced_recognition)
+        # --- 按钮1: 高级CVOCR识别 ---
+        btn_start_recognition = tk.Button(recognition_frame, text="🚀 高级CVOCR识别", command=self.start_enhanced_recognition)
         design.apply_button_style(btn_start_recognition, 'primary')
         btn_start_recognition.pack(fill='x', pady=design.get_spacing('1'))
+        
+        # 中文注释
+        advanced_desc = ttk.Label(recognition_frame, 
+                                  text="（推荐）使用您配置的所有高级预处理和分割技术，精度最高。",
+                                  font=design.get_font('xs'), foreground='gray', wraplength=380, justify='left')
+        advanced_desc.pack(anchor='w', pady=(0, design.get_spacing('2')))
 
+        # --- 按钮2: 批量处理 ---
         btn_batch_process = tk.Button(recognition_frame, text="⚡ 批量处理", command=self.batch_process)
         design.apply_button_style(btn_batch_process, 'secondary')
         btn_batch_process.pack(fill='x', pady=design.get_spacing('1'))
         
-        btn_quick_ocr = tk.Button(recognition_frame, text="⚡ 快速OCR", command=self.quick_ocr)
+        # --- 按钮3: 快速CVOCR识别 ---
+        btn_quick_ocr = tk.Button(recognition_frame, text="⚡ 快速CVOCR识别", command=self.quick_ocr)
         design.apply_button_style(btn_quick_ocr, 'secondary')
         btn_quick_ocr.pack(fill='x', pady=design.get_spacing('1'))
+        
+        # 中文注释
+        quick_desc = ttk.Label(recognition_frame, 
+                               text="（快速）跳过所有复杂处理，直接调用Tesseract进行端到端识别。",
+                               font=design.get_font('xs'), foreground='gray', wraplength=380, justify='left')
+        quick_desc.pack(anchor='w', pady=(0, design.get_spacing('2')))
     
     def _create_advanced_settings_section(self):
         """
-        创建高级设置区，包含预处理、显示、保存和性能设置。
-        对预处理设置进行了重新组织和布局优化。
+        创建高级设置区（V4.1 - 完全手动控制 & 预设管理版）。
+        - 为所有预处理操作添加独立的启用/禁用复选框。
+        - 移除所有后台自动策略，流程完全由用户勾选决定。
+        - 新增预设保存与加载功能。
+        - 新增对核心转换步骤（灰度、二值化）的控制。
         """
         advanced_frame = ttk.LabelFrame(self.inner_control_frame, text="高级设置", padding=design.get_spacing('3'))
         advanced_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
         
-        # --- 预处理设置 ---
+        # --- 预设管理 ---
+        preset_frame = ttk.LabelFrame(advanced_frame, text="预设管理", padding=design.get_spacing('2'))
+        preset_frame.pack(fill='x', pady=design.get_spacing('1'), padx=design.get_spacing('1'))
+        
+        btn_save_preset = tk.Button(preset_frame, text="💾 保存当前预设", command=self._save_preset_dialog)
+        design.apply_button_style(btn_save_preset, 'secondary')
+        btn_save_preset.pack(side='left', padx=(0, design.get_spacing('2')))
+
+        btn_load_preset = tk.Button(preset_frame, text="📂 加载预设", command=self._load_preset_dialog)
+        design.apply_button_style(btn_load_preset, 'secondary')
+        btn_load_preset.pack(side='left')
+        
+        # --- 预处理总开关 ---
         preprocessing_frame = ttk.LabelFrame(advanced_frame, text="图像预处理选项", padding=design.get_spacing('2'))
         preprocessing_frame.pack(fill='x', pady=design.get_spacing('1'))
         
-        # 基础预处理开关
-        ttk.Checkbutton(preprocessing_frame, text="🔧 启用智能预处理",
+        ttk.Checkbutton(preprocessing_frame, text="🔧 启用预处理 (总开关)",
                         variable=self.settings['enable_preprocessing'], style='TCheckbutton').pack(anchor='w')
-        ttk.Checkbutton(preprocessing_frame, text="⚡ 强制高强度预处理 (忽视质量评估)",
-                        variable=self.settings['enable_advanced_preprocessing'], style='TCheckbutton').pack(anchor='w')
         
         ttk.Separator(preprocessing_frame, orient='horizontal').pack(fill='x', pady=design.get_spacing('2'))
 
-        # 几何校正组
+        # --- 几何校正组 (现在每个都有自己的开关) ---
         geo_frame = ttk.LabelFrame(preprocessing_frame, text="几何校正", padding=design.get_spacing('2'))
         geo_frame.pack(fill='x', pady=design.get_spacing('1'))
         
-        # 倾斜校正
         deskew_row = ttk.Frame(geo_frame)
-        deskew_row.pack(fill='x')
-        ttk.Checkbutton(deskew_row, text="📐 启用倾斜校正", variable=self.settings['enable_deskew'], style='TCheckbutton').pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(deskew_row, text="角度阈值:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(deskew_row, from_=0.1, to=5.0, variable=self.settings['deskew_angle_threshold'], orient='horizontal', length=80).pack(side='left', padx=(0, design.get_spacing('1')))
+        deskew_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(deskew_row, text="📐 倾斜校正", variable=self.settings['enable_deskew'], style='TCheckbutton').pack(side='left')
+        ttk.Label(deskew_row, text="角度阈值:").pack(side='left', padx=(design.get_spacing('4'), design.get_spacing('1')))
+        ttk.Scale(deskew_row, from_=0.1, to=5.0, variable=self.settings['deskew_angle_threshold'], orient='horizontal', length=100).pack(side='left')
         
-        # 边框处理和裁剪
-        border_crop_row = ttk.Frame(geo_frame)
-        border_crop_row.pack(fill='x')
-        ttk.Checkbutton(border_crop_row, text="🖼️ 移除边框", variable=self.settings['remove_borders'], style='TCheckbutton').pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(border_crop_row, text="边框阈值:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数 (如果存在)
-        ttk.Scale(border_crop_row, from_=0, to=100, variable=self.settings['border_threshold'], orient='horizontal', length=80).pack(side='left', padx=(0, design.get_spacing('1')))
+        border_row = ttk.Frame(geo_frame)
+        border_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(border_row, text="🖼️ 移除边框", variable=self.settings['remove_borders'], style='TCheckbutton').pack(side='left')
+        ttk.Label(border_row, text="边框阈值:").pack(side='left', padx=(design.get_spacing('4'), design.get_spacing('1')))
+        ttk.Scale(border_row, from_=0, to=100, variable=self.settings['border_threshold'], orient='horizontal', length=100).pack(side='left')
         
-        ttk.Checkbutton(geo_frame, text="✂️ 裁剪到内容", variable=self.settings['crop_to_content'], style='TCheckbutton').pack(anchor='w', padx=(0, 0))
-        ttk.Checkbutton(geo_frame, text="📄 页面边框检测 (含透视校正)", variable=self.settings['page_border_detection'], style='TCheckbutton').pack(anchor='w', padx=(0, 0))
+        ttk.Checkbutton(geo_frame, text="✂️ 裁剪到内容", variable=self.settings['crop_to_content'], style='TCheckbutton').pack(anchor='w')
+        ttk.Checkbutton(geo_frame, text="📄 页面边框检测", variable=self.settings['page_border_detection'], style='TCheckbutton').pack(anchor='w')
 
-        ttk.Separator(preprocessing_frame, orient='horizontal').pack(fill='x', pady=design.get_spacing('2'))
-
-        # 图像增强组
+        # --- 图像增强与降噪组 (现在每个都有自己的开关) ---
         enhance_frame = ttk.LabelFrame(preprocessing_frame, text="图像增强与降噪", padding=design.get_spacing('2'))
         enhance_frame.pack(fill='x', pady=design.get_spacing('1'))
 
-        # 阴影移除
-        ttk.Checkbutton(enhance_frame, text="🌫️ 阴影移除", variable=self.settings['shadow_removal'], style='TCheckbutton').pack(anchor='w', padx=(0, 0))
-
-        # 高级降噪
-        denoise_row = ttk.Frame(enhance_frame)
-        denoise_row.pack(fill='x')
-        # 修正：通过 onvalue/offvalue (1.0/0.0) 控制降噪开关，并移除 resolution 参数
-        ttk.Checkbutton(denoise_row, text="⚪ 高级降噪", variable=self.settings['denoise_strength'], style='TCheckbutton', onvalue=1.0, offvalue=0.0).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(denoise_row, text="强度:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(denoise_row, from_=0.0, to=1.0, variable=self.settings['denoise_strength'], orient='horizontal', length=80).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(denoise_row, text="边缘保留:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(denoise_row, from_=0.0, to=1.0, variable=self.settings['edge_preservation'], orient='horizontal', length=80).pack(side='left', padx=(0, design.get_spacing('1')))
+        ttk.Checkbutton(enhance_frame, text="🌫️ 阴影移除", variable=self.settings['shadow_removal'], style='TCheckbutton').pack(anchor='w')
         
-        
-        # 双边滤波
         bilateral_row = ttk.Frame(enhance_frame)
-        bilateral_row.pack(fill='x')
-        ttk.Checkbutton(bilateral_row, text="💧 双边滤波", variable=self.settings['bilateral_filter'], style='TCheckbutton').pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(bilateral_row, text="直径:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数 (如果存在)
-        ttk.Scale(bilateral_row, from_=1, to=15, variable=self.settings['bilateral_d'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(bilateral_row, text="颜色Sigma:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(bilateral_row, from_=10, to=200, variable=self.settings['bilateral_sigma_color'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(bilateral_row, text="空间Sigma:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(bilateral_row, from_=10, to=200, variable=self.settings['bilateral_sigma_space'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
+        bilateral_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(bilateral_row, text="💧 双边滤波", variable=self.settings['bilateral_filter'], style='TCheckbutton').pack(side='left')
+        ttk.Label(bilateral_row, text="直径:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
+        ttk.Scale(bilateral_row, from_=1, to=15, variable=self.settings['bilateral_d'], orient='horizontal', length=60).pack(side='left')
         
-        # 直方图均衡化和CLAHE
-        hist_clahe_row = ttk.Frame(enhance_frame)
-        hist_clahe_row.pack(fill='x')
-        ttk.Checkbutton(hist_clahe_row, text="📈 直方图均衡化", variable=self.settings['histogram_equalization'], style='TCheckbutton').pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Checkbutton(hist_clahe_row, text="🔆 CLAHE增强", variable=self.settings['apply_clahe'], style='TCheckbutton').pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
-        ttk.Label(hist_clahe_row, text="裁剪限制:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(hist_clahe_row, from_=1.0, to=5.0, variable=self.settings['clahe_clip_limit'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(hist_clahe_row, text="网格尺寸:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(hist_clahe_row, from_=2, to=16, variable=self.settings['clahe_tile_grid_size_x'], orient='horizontal', length=40).pack(side='left')
-        # 修正：移除 resolution 参数
-        ttk.Scale(hist_clahe_row, from_=2, to=16, variable=self.settings['clahe_tile_grid_size_y'], orient='horizontal', length=40).pack(side='left')
+        ttk.Checkbutton(enhance_frame, text="📈 直方图均衡化", variable=self.settings['histogram_equalization'], style='TCheckbutton').pack(anchor='w')
+        
+        clahe_row = ttk.Frame(enhance_frame)
+        clahe_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(clahe_row, text="🔆 CLAHE增强", variable=self.settings['apply_clahe'], style='TCheckbutton').pack(side='left')
+        ttk.Label(clahe_row, text="裁剪限制:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
+        ttk.Scale(clahe_row, from_=1.0, to=5.0, variable=self.settings['clahe_clip_limit'], orient='horizontal', length=80).pack(side='left')
 
-        # 反锐化掩模
         unsharp_row = ttk.Frame(enhance_frame)
-        unsharp_row.pack(fill='x')
-        ttk.Checkbutton(unsharp_row, text="✨ 反锐化掩模", variable=self.settings['unsharp_mask'], style='TCheckbutton').pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(unsharp_row, text="半径:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(unsharp_row, from_=0.5, to=5.0, variable=self.settings['unsharp_radius'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
-        ttk.Label(unsharp_row, text="强度:").pack(side='left', padx=(design.get_spacing('2'), 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(unsharp_row, from_=0.0, to=3.0, variable=self.settings['unsharp_amount'], orient='horizontal', length=50).pack(side='left', padx=(0, design.get_spacing('1')))
+        unsharp_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(unsharp_row, text="✨ 反锐化掩模", variable=self.settings['unsharp_mask'], style='TCheckbutton').pack(side='left')
+        ttk.Label(unsharp_row, text="半径:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
+        ttk.Scale(unsharp_row, from_=0.5, to=5.0, variable=self.settings['unsharp_radius'], orient='horizontal', length=80).pack(side='left')
+        ttk.Label(unsharp_row, text="强度:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
+        ttk.Scale(unsharp_row, from_=0.0, to=3.0, variable=self.settings['unsharp_amount'], orient='horizontal', length=80).pack(side='left')
         
-        ttk.Separator(preprocessing_frame, orient='horizontal').pack(fill='x', pady=design.get_spacing('2'))
+        # --- 核心转换步骤控制 ---
+        core_conversion_frame = ttk.LabelFrame(preprocessing_frame, text="核心转换步骤", padding=design.get_spacing('2'))
+        core_conversion_frame.pack(fill='x', pady=design.get_spacing('1'))
 
-        # 二值化组
-        binarization_frame = ttk.LabelFrame(preprocessing_frame, text="二值化", padding=design.get_spacing('2'))
-        binarization_frame.pack(fill='x', pady=design.get_spacing('1'))
-
-        # 自适应阈值
-        adaptive_thresh_row1 = ttk.Frame(binarization_frame)
-        adaptive_thresh_row1.pack(fill='x')
-        ttk.Label(adaptive_thresh_row1, text="自适应阈值块大小:").pack(side='left', padx=(0, 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(adaptive_thresh_row1, from_=3, to=25, variable=self.settings['adaptive_block_size'], orient='horizontal', length=100).pack(side='left', padx=(0, design.get_spacing('1')))
+        ttk.Checkbutton(core_conversion_frame, text="⚙️ 转换为灰度图", 
+                        variable=self.settings['enable_grayscale'], style='TCheckbutton').pack(anchor='w')
         
-        adaptive_thresh_row2 = ttk.Frame(binarization_frame)
-        adaptive_thresh_row2.pack(fill='x')
-        ttk.Label(adaptive_thresh_row2, text="自适应阈值C值:").pack(side='left', padx=(0, 0))
-        # 修正：移除 resolution 参数
-        ttk.Scale(adaptive_thresh_row2, from_=0, to=10, variable=self.settings['adaptive_c_constant'], orient='horizontal', length=100).pack(side='left', padx=(0, design.get_spacing('1')))
+        binarization_row = ttk.Frame(core_conversion_frame)
+        binarization_row.pack(fill='x', pady=(0, design.get_spacing('1')))
+        ttk.Checkbutton(binarization_row, text="⚫⚪ 二值化", 
+                        variable=self.settings['enable_binarization'], style='TCheckbutton').pack(side='left')
 
+        ttk.Label(binarization_row, text="块大小:").pack(side='left', padx=(design.get_spacing('4'), design.get_spacing('1')))
+        ttk.Scale(binarization_row, from_=3, to=35, variable=self.settings['adaptive_block_size'], orient='horizontal', length=80).pack(side='left')
+        ttk.Label(binarization_row, text="C值:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
+        ttk.Scale(binarization_row, from_=0, to=15, variable=self.settings['adaptive_c_constant'], orient='horizontal', length=80).pack(side='left')
 
-        # --- 显示设置 ---
-        display_frame = ttk.LabelFrame(advanced_frame, text="显示设置", padding=design.get_spacing('2'))
+        # --- 显示与保存设置 ---
+        display_frame = ttk.LabelFrame(advanced_frame, text="显示与保存设置", padding=design.get_spacing('2'))
         display_frame.pack(fill='x', pady=design.get_spacing('1'))
         
-        ttk.Checkbutton(display_frame, text="📊 显示置信度",
+        ttk.Checkbutton(display_frame, text="📊 在结果表格中显示置信度",
                         variable=self.settings['show_confidence'], style='TCheckbutton').pack(anchor='w')
-        ttk.Checkbutton(display_frame, text="✨ 自动纠错",
-                        variable=self.settings['auto_correct'], style='TCheckbutton').pack(anchor='w')
-        
-        # --- 保存设置 ---
-        save_frame = ttk.LabelFrame(advanced_frame, text="保存设置", padding=design.get_spacing('2'))
-        save_frame.pack(fill='x', pady=design.get_spacing('1'))
-        
-        ttk.Checkbutton(save_frame, text="💾 保存识别结果",
-                        variable=self.settings['save_results'], style='TCheckbutton').pack(anchor='w')
-        ttk.Checkbutton(save_frame, text="📄 自动保存结果",
+        ttk.Checkbutton(display_frame, text="💾 自动保存识别结果 (JSON)",
                         variable=self.settings['auto_save_results'], style='TCheckbutton').pack(anchor='w')
         
         # --- 性能设置 ---
         performance_frame = ttk.LabelFrame(advanced_frame, text="性能设置", padding=design.get_spacing('2'))
         performance_frame.pack(fill='x', pady=design.get_spacing('1'))
         
-        ttk.Checkbutton(performance_frame, text="🖥️ 使用GPU加速 (实验性)",
+        ttk.Checkbutton(performance_frame, text="🖥️ 使用GPU加速 (需PyTorch GPU版)",
                         variable=self.settings['use_gpu'], style='TCheckbutton').pack(anchor='w')
-        ttk.Checkbutton(performance_frame, text="🔄 批量处理模式",
-                        variable=self.settings['batch_processing'], style='TCheckbutton').pack(anchor='w')
     
     
     
-    
+    def _save_preset_dialog(self):
+        """打开对话框让用户命名并保存当前预设。
+        此版本会保存所有预处理相关的设置，包括新的高级分割技术选项。
+        """
+        from tkinter import simpledialog
+        preset_name = simpledialog.askstring("保存预设", "请输入预设名称:", parent=self.root)
+        
+        if preset_name:
+            try:
+                # 收集所有与预处理和分割技术相关的设置值
+                preset_settings = {}
+                
+                # 定义一个完整的列表，包含所有需要保存到预设中的设置项的键
+                preset_keys = [
+                    # 预处理总开关
+                    'enable_preprocessing',
+                    
+                    # 几何校正
+                    'enable_deskew', 
+                    'deskew_angle_threshold', 
+                    'remove_borders', 
+                    'border_threshold', 
+                    'crop_to_content', 
+                    'page_border_detection', 
+                    
+                    # 图像增强与降噪
+                    'shadow_removal',
+                    'bilateral_filter', 
+                    'bilateral_d', 
+                    'histogram_equalization', 
+                    'apply_clahe',
+                    'clahe_clip_limit', 
+                    'unsharp_mask', 
+                    'unsharp_radius', 
+                    'unsharp_amount',
+                    
+                    # 核心转换步骤
+                    'enable_grayscale', 
+                    'enable_binarization',
+                    'adaptive_block_size', 
+                    'adaptive_c_constant',
+                    
+                    # 高级分割技术选项
+                    'seg_simple_high_contrast', 
+                    'seg_improved_mser', 
+                    'seg_multiscale_contour',
+                    'seg_gradient_based', 
+                    'seg_multilevel_mser', 
+                    'seg_stroke_width_transform',
+                    'seg_connected_components', 
+                    'seg_character_level'
+                ]
+                
+                # 遍历列表，从 self.settings 字典中获取每个设置的当前值
+                for key in preset_keys:
+                    if key in self.settings:
+                        preset_settings[key] = self.settings[key].get()
+
+                # 读取现有的预设文件（如果存在），以便在不覆盖其他预设的情况下添加或更新
+                presets = {}
+                if os.path.exists('cvocr_presets.json'):
+                    with open('cvocr_presets.json', 'r', encoding='utf-8') as f:
+                        try:
+                            presets = json.load(f)
+                        except json.JSONDecodeError:
+                            # 如果文件损坏或为空，则忽略旧内容
+                            pass
+                
+                # 更新或添加当前要保存的预设
+                presets[preset_name] = preset_settings
+                
+                # 将更新后的所有预设写回文件
+                with open('cvocr_presets.json', 'w', encoding='utf-8') as f:
+                    json.dump(presets, f, indent=2, ensure_ascii=False)
+                
+                self.log_message(f"💾 预设 '{preset_name}' 已保存。", 'SUCCESS')
+                messagebox.showinfo("保存成功", f"预设 '{preset_name}' 已成功保存！")
+                
+            except Exception as e:
+                self.log_message(f"❌ 保存预设失败: {e}", 'ERROR')
+                messagebox.showerror("保存失败", f"保存预设失败: {e}")
+    def _load_preset_dialog(self):
+        """打开对话框让用户选择并加载预设"""
+        if not os.path.exists('cvocr_presets.json'):
+            messagebox.showinfo("无预设", "没有找到已保存的预设文件。")
+            return
+
+        try:
+            with open('cvocr_presets.json', 'r', encoding='utf-8') as f:
+                presets = json.load(f)
+            
+            if not presets:
+                messagebox.showinfo("无预设", "预设文件为空。")
+                return
+
+            # 创建一个选择窗口
+            load_window = tk.Toplevel(self.root)
+            load_window.title("加载预设")
+            load_window.geometry("300x400")
+            load_window.transient(self.root)
+            load_window.grab_set()
+
+            tk.Label(load_window, text="请选择一个预设加载:").pack(pady=10)
+            
+            listbox = tk.Listbox(load_window)
+            listbox.pack(fill='both', expand=True, padx=10, pady=5)
+            for name in presets.keys():
+                listbox.insert(tk.END, name)
+
+            def on_load():
+                selected_indices = listbox.curselection()
+                if not selected_indices:
+                    return
+                
+                selected_name = listbox.get(selected_indices[0])
+                settings_to_load = presets[selected_name]
+                
+                # 应用加载的设置到UI
+                for key, value in settings_to_load.items():
+                    if key in self.settings:
+                        self.settings[key].set(value)
+                
+                self.log_message(f"📂 预设 '{selected_name}' 已加载。", 'SUCCESS')
+                load_window.destroy()
+
+            load_button = tk.Button(load_window, text="加载", command=on_load)
+            design.apply_button_style(load_button, 'primary')
+            load_button.pack(pady=10)
+
+        except Exception as e:
+            self.log_message(f"❌ 加载预设失败: {e}", 'ERROR')
+            messagebox.showerror("加载失败", f"加载预设失败: {e}")
     def _create_result_operations_section(self):
         """创建结果操作区"""
         result_frame = ttk.LabelFrame(self.inner_control_frame, text="结果操作", padding=design.get_spacing('3'))
@@ -6538,99 +7783,118 @@ class EnhancedCVOCRGUI:
     
     # 核心业务方法实现
     def initialize_cvocr(self):
-        """初始化CVOCR引擎"""
-        language_str = self.settings['language'].get()
+        """
+        初始化CVOCR引擎 (V4.5 - 最终配置同步版)。
+        - 全面、安全地从GUI收集所有设置。
+        - 将所有设置完整地更新到后端管理器。
+        - 使用正确的设置变量启动异步初始化流程。
+        """
+        # --- 步骤1: 全面、安全地从GUI收集所有设置 ---
+        current_gui_config = {}
+        for key, var in self.settings.items():
+            # 安全地获取值，跳过像 'oem_options' 这样的特殊字典
+            if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)):
+                current_gui_config[key] = var.get()
+        # 手动添加OEM选项字典
+        current_gui_config['oem_options'] = {k: v.get() for k, v in self.settings['oem_options'].items()}
+        
+        # --- 步骤2: 从收集的配置中提取初始化所需的关键参数 ---
+        language_str = current_gui_config.get('language', 'auto')
         language = OCRLanguage(language_str) if language_str != 'auto' else OCRLanguage.AUTO
-        precision_level_str = self.settings['precision_level'].get()
-        precision_level = OCRPrecisionLevel(precision_level_str)
-        use_gpu = self.settings['use_gpu'].get()
+        
+        use_gpu = current_gui_config.get('use_gpu', False)
 
-        self.cvocr_manager.config.update({
-            'enable_super_resolution': self.settings['enable_super_resolution'].get(),
-            'enable_layout_analysis': self.settings['enable_layout_analysis'].get(),
-            'enable_context_analysis': self.settings['enable_context_analysis'].get(),
-            'enable_transformer_ocr': self.settings['enable_transformer_ocr'].get(),
-            'use_gpu': use_gpu,
-            'enable_deskew': self.settings['enable_deskew'].get(),
-            'deskew_angle_threshold': self.settings['deskew_angle_threshold'].get(),
-            'remove_borders': self.settings['remove_borders'].get(),
-            'border_threshold': self.settings['border_threshold'].get(),
-            'crop_to_content': self.settings['crop_to_content'].get(),
-            'page_border_detection': self.settings['page_border_detection'].get(),
-            'shadow_removal': self.settings['shadow_removal'].get(),
-            'denoise_strength': self.settings['denoise_strength'].get(),
-            'edge_preservation': self.settings['edge_preservation'].get(),
-            'unsharp_mask': self.settings['unsharp_mask'].get(),
-            'unsharp_radius': self.settings['unsharp_radius'].get(),
-            'unsharp_amount': self.settings['unsharp_amount'].get(),
-            'histogram_equalization': self.settings['histogram_equalization'].get(),
-            'bilateral_filter': self.settings['bilateral_filter'].get(),
-            'bilateral_d': self.settings['bilateral_d'].get(),
-            'bilateral_sigma_color': self.settings['bilateral_sigma_color'].get(),
-            'bilateral_sigma_space': self.settings['bilateral_sigma_space'].get(),
-            'apply_clahe': self.settings['apply_clahe'].get(),
-            'clahe_clip_limit': self.settings['clahe_clip_limit'].get(),
-            'clahe_tile_grid_size': (self.settings['clahe_tile_grid_size_x'].get(), self.settings['clahe_tile_grid_size_y'].get()),
-            'adaptive_block_size': self.settings['adaptive_block_size'].get(),
-            'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
-        })
+        # --- 步骤3: 将所有GUI设置完整地同步到后端管理器的配置字典中 ---
+        self.cvocr_manager.config.update(current_gui_config)
 
+        # --- 步骤4: 定义并启动异步初始化任务 ---
         async def init_worker_async():
-            self.log_message(f"🚀 正在初始化CVOCR引擎 (语言: {language.value}, 精度: {precision_level.value}, GPU: {use_gpu})...", 'INFO')
+            self.log_message(f"🚀 正在初始化CVOCR引擎 (语言: {language.value}, 精度: 自定义, GPU: {use_gpu})...", 'INFO')
             
-            enabled_components_log = []
-            if self.cvocr_manager.config.get('enable_super_resolution'): enabled_components_log.append("FSRCNN")
+            # 为日志构建启用的组件列表
+            enabled_components_log = ["Tesseract"] # Tesseract is always a base component
             if self.cvocr_manager.config.get('enable_layout_analysis'): enabled_components_log.append("LayoutLMv2")
             if self.cvocr_manager.config.get('enable_context_analysis'): enabled_components_log.append("GPT-Neo")
             if self.cvocr_manager.config.get('enable_transformer_ocr'): enabled_components_log.append("TransformerOCR")
-            enabled_components_log.append("Tesseract")
+            if self.settings['enable_advanced_segmentation'].get():
+                 enabled_components_log.append("YOLO")
+            else:
+                 enabled_components_log.append("PP-OCRv3")
 
-            if len(enabled_components_log) > 1:
-                self.log_message(f"🔧 启用组件: {', '.join(enabled_components_log)}", 'INFO')
+            self.log_message(f"🔧 启用组件: {', '.join(enabled_components_log)}", 'INFO')
             
             try:
+                # 在后台线程池中运行阻塞的 initialize 方法
                 success, message = await self.loop.run_in_executor(
-                    self.async_ocr_processor.executor, # 使用 OCR 处理器的线程池
+                    self.async_ocr_processor.executor,
                     self.cvocr_manager.initialize,
                     language,
-                    precision_level,
                     use_gpu
                 )
+                # 将结果回调到主线程以更新UI
                 self.root.after(0, self._handle_init_result, success, message)
             except Exception as e:
-                error_msg = f"CVOCR引擎初始化异常: {str(e)}\n{traceback.format_exc()}"
+                error_msg = f"CVOCR引擎初始化时发生未捕获的异常: {str(e)}"
+                logger.error(error_msg, exc_info=True)
                 self.root.after(0, self._handle_init_result, False, error_msg)
             finally:
+                # 确保无论成功与否，UI的“处理中”状态都会被重置
                 self.root.after(0, self.set_processing, False)
 
+        # 启动UI的“处理中”状态（例如，开始进度条动画）
         self.set_processing(True)
-        # 将异步初始化任务提交到 asyncio 事件循环
+        # 从Tkinter主线程安全地将异步任务调度到后台的asyncio事件循环中
         self.loop.call_soon_threadsafe(self.loop.create_task, init_worker_async())
+    
+    
+    
     def _handle_init_result(self, success: bool, message: str):
-        """处理初始化结果"""
+        """
+        处理初始化结果，并更新GUI的各个相关部分。
+        - 更新系统状态区的标签和颜色。
+        - 记录详细的初始化日志。
+        - 更新新增的TransformerOCR模型加载状态标签。
+        - 弹出对话框通知用户初始化结果。
+        """
         if success:
             self.status_label.config(text="CVOCR引擎就绪", style='Success.TLabel')
             self.log_message(f"✅ {message}", 'SUCCESS')
             
-            # 显示版本信息
+            # 显示详细的版本和配置信息
             version_info = self.cvocr_manager.version_info
             self.log_message(f"📊 初始化耗时: {version_info.get('init_time', 0):.2f}秒", 'INFO')
             self.log_message(f"🔧 Tesseract版本: {version_info.get('tesseract', 'unknown')}", 'INFO')
             self.log_message(f"🌐 识别语言: {version_info.get('language', 'unknown')}", 'INFO')
             
-            # 显示组件状态
+            # 显示已启用的AI组件状态
             components = version_info.get('components', {})
             if components:
-                enabled_components = [comp for comp, enabled in components.items() if enabled]
+                enabled_components = [comp.replace('_enabled', '').upper() for comp, enabled in components.items() if enabled]
                 if enabled_components:
                     self.log_message(f"🎯 已启用组件: {', '.join(enabled_components)}", 'INFO')
             
+            # --- 新增：更新TrOCR模型加载状态标签 ---
+            # 根据初始化结果中的组件状态来设置标签的文本和颜色。
+            if components.get('transformer_ocr_enabled'):
+                self.trocr_model_status_label.config(text="✅ 已加载", foreground="green")
+            elif self.settings['enable_transformer_ocr'].get():
+                # 如果用户勾选了启用，但初始化后组件状态仍为未启用，则说明加载失败
+                self.trocr_model_status_label.config(text="❌ 加载失败", foreground="red")
+            else:
+                # 如果用户未勾选启用，则显示为未启用状态
+                self.trocr_model_status_label.config(text=" (未启用)", foreground="gray")
+
             messagebox.showinfo("初始化成功", f"{message}\n\nCVOCR引擎已就绪，可以开始文本识别！")
         else:
             self.status_label.config(text="初始化失败", style='Error.TLabel')
             self.log_message(f"❌ {message}", 'ERROR')
+            
+            # --- 新增：在初始化失败时，同样更新TrOCR模型状态标签 ---
+            # 如果初始化失败，所有AI模型都应被视为未加载
+            self.trocr_model_status_label.config(text="❌ 未加载", foreground="red")
+            
             messagebox.showerror("初始化失败", f"{message}\n\n建议先运行系统检查。")
-    
+
     async def _trigger_initial_system_check_async(self):
         """异步触发初始系统检查"""
         await self.check_system_async()
@@ -6916,7 +8180,11 @@ class EnhancedCVOCRGUI:
             self.initialize_cvocr()
     
     def select_image(self):
-        """选择图片文件"""
+        """
+        选择图片文件，并进行验证。
+        (V4.3 - 缓存清除版): 选择新图片时，会自动清除上一张图片的预处理缓存，
+        以确保后续预览功能（如分割预览）使用的是当前图片的最新预处理结果。
+        """
         file_path = filedialog.askopenfilename(
             title="选择图片文件",
             filetypes=[
@@ -6932,7 +8200,7 @@ class EnhancedCVOCRGUI:
         )
         
         if file_path:
-            # 使用增强验证
+            # 使用增强的图像验证方法
             valid, message = AdvancedTextImageProcessor.validate_image(file_path)
             if not valid:
                 self.log_message(f"❌ 图片验证失败: {message}", 'ERROR')
@@ -6940,9 +8208,15 @@ class EnhancedCVOCRGUI:
                 return
             
             self.current_image_path = file_path
+            
+            # --- 关键修正：清除旧的预处理缓存 ---
+            self._cached_preprocessed_image = None
+            self.log_message("新图片已选择，预处理缓存已清除。", "DEBUG")
+            # --- 修正结束 ---
+
             self.display_image(file_path)
             
-            # 获取详细图片信息
+            # 获取并显示详细的图片信息
             try:
                 with Image.open(file_path) as img:
                     width, height = img.size
@@ -6955,6 +8229,7 @@ class EnhancedCVOCRGUI:
                 self.log_message(f"✅ 已选择图片: {os.path.basename(file_path)}", 'SUCCESS')
             except Exception as e:
                 self.log_message(f"❌ 读取图片信息失败: {e}", 'ERROR')
+
 
     def select_batch_images(self):
         """选择多个图片文件进行批量处理"""
@@ -7000,60 +8275,75 @@ class EnhancedCVOCRGUI:
             self.notebook.select(self.notebook.index("end") - 2) # 切换到历史记录或统计页
             messagebox.showinfo("批量处理", f"已选择 {len(valid_files)} 张图片，点击 '批量处理' 按钮开始。")
 
-    def display_image(self, image_path: str, text_blocks: Optional[List[Dict]] = None):
+    def display_image(self, image_path: str, text_blocks: Optional[List[Dict]] = None, shape_blocks: Optional[List[Dict]] = None):
         """
-        在Canvas上显示图像，并根据需要精确绘制对齐的边界框 (V3.14 坐标对齐最终版)。
-        - 存储原始图像尺寸、缩放比例和画布偏移量。
-        - 确保所有绘制的边界框都经过正确的坐标系转换。
+        在Canvas上显示图像，并根据需要精确绘制文本和图形的边界框。
+        - 保持图像的原始纵横比进行缩放。
+        - 将缩放后的图像在画布中居中显示。
+        - 存储坐标转换参数，以便后续功能（如高亮）使用。
+        - 为文本和图形绘制不同样式的边界框。
+
+        Args:
+            image_path (str): 要显示的图像文件的完整路径。
+            text_blocks (Optional[List[Dict]]): 包含已识别文本块及其边界框的列表。
+            shape_blocks (Optional[List[Dict]]): 包含已检测图形及其边界框的列表。
         """
         try:
+            # 1. 验证文件路径
             if not os.path.exists(image_path):
                 self.log_message(f"❌ 图像文件不存在: {image_path}", 'ERROR')
                 self.image_canvas.delete("all")
                 return
 
-            # 1. 加载原始图像并清除画布
+            # 2. 加载原始图像并清空画布
             original_img = Image.open(image_path)
             self.image_canvas.delete("all")
 
-            # 2. 存储关键的原始尺寸信息
+            # 3. 存储关键的原始尺寸信息
             self._last_original_image_size = original_img.size
             img_width, img_height = self._last_original_image_size
 
-            # 3. 获取画布尺寸并计算转换参数
+            # 4. 获取画布尺寸
             canvas_width = self.image_canvas.winfo_width()
             canvas_height = self.image_canvas.winfo_height()
 
-            # 如果画布尚未渲染，则不进行绘制
+            # 如果画布尚未渲染（尺寸为0或1），则中止绘制以避免错误
             if canvas_width <= 1 or canvas_height <= 1:
                 return
 
-            # 计算缩放比例，使图片能完整地显示在画布内
-            scale_ratio = min(canvas_width / img_width, canvas_height / img_height)
-            
+            # 5. 计算缩放比例和偏移量以保持纵横比并居中
+            # 分别计算水平和垂直方向的缩放比例
+            scale_ratio_x = canvas_width / img_width
+            scale_ratio_y = canvas_height / img_height
+
+            # 选择较小的比例作为最终的统一缩放因子，以确保整个图像都能被容纳
+            final_scale_ratio = min(scale_ratio_x, scale_ratio_y)
+
             # 计算缩放后的显示尺寸
-            display_width = int(img_width * scale_ratio)
-            display_height = int(img_height * scale_ratio)
+            display_width = int(img_width * final_scale_ratio)
+            display_height = int(img_height * final_scale_ratio)
             
             # 计算为了在画布中居中而产生的左上角偏移量
             x_offset = (canvas_width - display_width) // 2
             y_offset = (canvas_height - display_height) // 2
             
-            # 4. 存储这些转换参数，以便后续使用（如高亮）
-            self._last_display_scale_ratio = scale_ratio
+            # 6. 存储这些转换参数，以便后续功能（如高亮、点击等）可以复用
+            self._last_display_scale_ratio_x = final_scale_ratio
+            self._last_display_scale_ratio_y = final_scale_ratio
             self._last_display_x_offset = x_offset
             self._last_display_y_offset = y_offset
 
-            # 5. 缩放图像并显示
+            # 7. 缩放图像并显示
+            # 使用LANCZOS（抗锯齿）算法以获得最佳的图像缩小质量
             resized_img = original_img.resize((display_width, display_height), Image.Resampling.LANCZOS)
             self.photo = ImageTk.PhotoImage(resized_img)
             self.image_canvas.create_image(x_offset, y_offset, image=self.photo, anchor='nw', tags="image")
-            self.image_canvas.config(scrollregion=self.image_canvas.bbox("all"))
-
-            # 6. 【核心修正】如果提供了文本块，则进行坐标转换并绘制
+            
+            # 8. 绘制文本块的边界框（红色）
             if text_blocks:
                 for block in text_blocks:
                     bbox = block.get('bbox')
+                    # 确保bbox存在且格式正确
                     if not bbox or len(bbox) != 4:
                         continue
                     
@@ -7061,22 +8351,49 @@ class EnhancedCVOCRGUI:
                     x1_orig, y1_orig, x2_orig, y2_orig = bbox
                     
                     # 应用缩放和偏移，计算出在Canvas上的最终坐标
-                    x1_canvas = int(x1_orig * scale_ratio + x_offset)
-                    y1_canvas = int(y1_orig * scale_ratio + y_offset)
-                    x2_canvas = int(x2_orig * scale_ratio + x_offset)
-                    y2_canvas = int(y2_orig * scale_ratio + y_offset)
+                    x1_canvas = int(x1_orig * self._last_display_scale_ratio_x + x_offset)
+                    y1_canvas = int(y1_orig * self._last_display_scale_ratio_y + y_offset)
+                    x2_canvas = int(x2_orig * self._last_display_scale_ratio_x + x_offset)
+                    y2_canvas = int(y2_orig * self._last_display_scale_ratio_y + y_offset)
                     
                     # 绘制与图像上文字完美对齐的矩形框
                     self.image_canvas.create_rectangle(
                         x1_canvas, y1_canvas, x2_canvas, y2_canvas, 
-                        outline='red', width=2, tags="bbox"
+                        outline='red', width=2, tags=("bbox", "text_bbox")
                     )
 
+            # 9. 绘制图形的边界框（绿色，更粗）
+            if shape_blocks:
+                for block in shape_blocks:
+                    bbox = block.get('bbox')
+                    if not bbox or len(bbox) != 4:
+                        continue
+                    
+                    x1_orig, y1_orig, x2_orig, y2_orig = bbox
+                    
+                    x1_canvas = int(x1_orig * self._last_display_scale_ratio_x + x_offset)
+                    y1_canvas = int(y1_orig * self._last_display_scale_ratio_y + y_offset)
+                    x2_canvas = int(x2_orig * self._last_display_scale_ratio_x + x_offset)
+                    y2_canvas = int(y2_orig * self._last_display_scale_ratio_y + y_offset)
+
+                    self.image_canvas.create_rectangle(
+                        x1_canvas, y1_canvas, x2_canvas, y2_canvas, 
+                        outline='green', width=3, tags=("bbox", "shape_bbox")
+                    )
+
+            # 10. 更新画布的滚动区域以包含所有绘制的内容
+            self.image_canvas.config(scrollregion=self.image_canvas.bbox("all"))
+
+            # 强制Tkinter立即更新界面
             self.root.update_idletasks()
+
         except Exception as e:
+            # 捕获所有可能的异常，如文件损坏、内存不足等
             self.log_message(f"❌ 显示图像或绘制边界框时失败: {e}", 'ERROR')
-            # 打印完整的堆栈跟踪以进行调试
+            # 打印完整的堆栈跟踪以方便调试
             traceback.print_exc()
+    
+    
     def reload_image(self):
         """重新加载当前图片"""
         if self.current_image_path:
@@ -7144,9 +8461,25 @@ class EnhancedCVOCRGUI:
         except Exception as e:
             self.log_message(f"❌ 获取图片详细信息失败: {e}", 'ERROR')
             messagebox.showerror("错误", f"获取图片详细信息失败:\n{e}")
-
+    def _get_enabled_segmentation_algorithms(self) -> List[str]:
+        """收集所有当前启用的高级分割算法名称"""
+        enabled_algos = []
+        for key, var in self.settings.items():
+            if key.startswith('seg_') and var.get():
+                # 将 'seg_improved_mser' 转换为 'improved_mser'
+                algo_name = key.replace('seg_', '')
+                enabled_algos.append(algo_name)
+        return enabled_algos
     def start_enhanced_recognition(self):
-        """开始增强文本识别 (V3.3 修正版)"""
+        """
+        开始增强文本识别 (V4.2 - GUI参数完全同步最终版)。
+        此方法作为用户点击“开始识别”按钮的入口，负责：
+        1. 执行所有前置检查（如处理状态、引擎初始化、图片选择）。
+        2. 全面收集GUI界面上所有相关的设置，包括所有预处理开关和高级分割技术选项。
+        3. 将这些设置更新到后端的 CVOCRManager 实例中。
+        4. 创建并调度一个异步的识别任务，以避免阻塞GUI。
+        """
+        # --- 步骤 1: 执行所有前置检查 ---
         if self.processing:
             messagebox.showwarning("处理中", "当前正在进行识别或批量处理，请稍候。")
             return
@@ -7168,22 +8501,27 @@ class EnhancedCVOCRGUI:
             self.log_message("❌ 识别操作取消：图片文件不存在。", 'ERROR')
             return
 
+        # --- 步骤 2: 设置处理状态并记录日志 ---
         self.set_processing(True)
         self.log_message(f"🚀 开始识别图片: {os.path.basename(self.current_image_path)}", 'INFO')
         
+        # --- 步骤 3: 全面收集GUI设置并更新后端管理器 ---
         language_str = self.settings['language'].get()
         language = OCRLanguage(language_str) if language_str != 'auto' else OCRLanguage.AUTO
-        precision_level_str = self.settings['precision_level'].get()
-        precision_level = OCRPrecisionLevel(precision_level_str)
         enable_preprocessing = self.settings['enable_preprocessing'].get()
-        force_intensive_preprocessing = self.settings['enable_advanced_preprocessing'].get()
         use_gpu = self.settings['use_gpu'].get()
 
         self.cvocr_manager.config.update({
+            # OCR核心参数
             'language': language.value,
-            'precision_level': precision_level.value,
+            'psm': self.settings['psm_mode'].get(),
+            'confidence_threshold': self.settings['confidence_threshold'].get(),
+            'oem_options': {k: v.get() for k, v in self.settings['oem_options'].items()},
+            
+            # 预处理主开关
             'enable_preprocessing_optimization': enable_preprocessing,
-            'force_intensive_preprocessing': force_intensive_preprocessing,
+            
+            # 详细预处理参数
             'enable_deskew': self.settings['enable_deskew'].get(),
             'deskew_angle_threshold': self.settings['deskew_angle_threshold'].get(),
             'remove_borders': self.settings['remove_borders'].get(),
@@ -7191,8 +8529,112 @@ class EnhancedCVOCRGUI:
             'crop_to_content': self.settings['crop_to_content'].get(),
             'page_border_detection': self.settings['page_border_detection'].get(),
             'shadow_removal': self.settings['shadow_removal'].get(),
-            'denoise_strength': self.settings['denoise_strength'].get(),
-            'edge_preservation': self.settings['edge_preservation'].get(),
+            'bilateral_filter': self.settings['bilateral_filter'].get(),
+            'bilateral_d': self.settings['bilateral_d'].get(),
+            'bilateral_sigma_color': self.settings['bilateral_sigma_color'].get(),
+            'bilateral_sigma_space': self.settings['bilateral_sigma_space'].get(),
+            'histogram_equalization': self.settings['histogram_equalization'].get(),
+            'apply_clahe': self.settings['apply_clahe'].get(),
+            'clahe_clip_limit': self.settings['clahe_clip_limit'].get(),
+            'clahe_tile_grid_size': (self.settings['clahe_tile_grid_size_x'].get(), self.settings['clahe_tile_grid_size_y'].get()),
+            'unsharp_mask': self.settings['unsharp_mask'].get(),
+            'unsharp_radius': self.settings['unsharp_radius'].get(),
+            'unsharp_amount': self.settings['unsharp_amount'].get(),
+            'adaptive_block_size': self.settings['adaptive_block_size'].get(),
+            'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
+            'enable_grayscale': self.settings['enable_grayscale'].get(),
+            'enable_binarization': self.settings['enable_binarization'].get(),
+            
+            # AI组件开关
+            'enable_layout_analysis': self.settings['enable_layout_analysis'].get(),
+            'enable_context_analysis': self.settings['enable_context_analysis'].get(),
+            'enable_transformer_ocr': self.settings['enable_transformer_ocr'].get(),
+            
+            # 性能与高级模型参数
+            'use_gpu': use_gpu,
+            'transformer_ocr_model': self.settings['transformer_ocr_model'].get(),
+            
+            # 高级分割/全元素检测参数
+            'enable_advanced_segmentation': self.settings['enable_advanced_segmentation'].get(),
+            'segmentation_recognizer': self.settings['segmentation_recognizer'].get(),
+            'enable_tesseract_fine_tuning': self.settings['enable_tesseract_fine_tuning'].get(),
+            'enabled_segmentation_algorithms': self._get_enabled_segmentation_algorithms(),
+            'enable_smart_line_merge': self.settings['enable_smart_line_merge'].get(),
+        })
+        
+        # --- 步骤 4: 创建并调度异步识别任务 ---
+        async def recognition_worker_async(image_path_to_process, enable_preproc, lang):
+            try:
+                # 在执行前，确保manager内部的language是最新的
+                self.cvocr_manager.language = lang
+                
+                # 更新Tesseract配置以匹配最新的语言和PSM设置
+                init_tess_success, init_tess_msg = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    self.cvocr_manager._initialize_tesseract
+                )
+                if not init_tess_success:
+                    self.log_message(f"❌ Tesseract引擎配置更新失败: {init_tess_msg}", 'ERROR')
+                    self.root.after(0, self.set_processing, False)
+                    self.root.after(0, messagebox.showerror, "识别失败", f"Tesseract引擎配置更新失败: {init_tess_msg}")
+                    return
+
+                # 调用核心识别方法，它将使用manager中已更新的config
+                results, message = await self.async_ocr_processor.run_blocking_ocr_task(
+                    image_path_to_process,
+                    enable_preproc
+                )
+                
+                # 将结果回调到主线程处理GUI更新
+                self.root.after(0, self._handle_recognition_result, image_path_to_process, results, message)
+            except Exception as e:
+                error_msg = f"识别图片 '{os.path.basename(image_path_to_process)}' 失败: {str(e)}\n{traceback.format_exc()}"
+                self.root.after(0, self._handle_recognition_result, image_path_to_process, None, error_msg)
+            finally:
+                # 确保无论成功失败，处理状态都会被重置
+                self.root.after(0, self.set_processing, False)
+                self.root.after(0, self._update_performance_display)
+
+        # 将异步任务提交到事件循环中执行
+        self.loop.call_soon_threadsafe(self.loop.create_task, recognition_worker_async(
+            self.current_image_path, 
+            enable_preprocessing, 
+            language
+        ))
+    
+    
+    def preview_preprocessing(self):
+        """
+        预览当前图像应用所有预处理设置后的效果。
+        此版本修复了因引用已移除的 'enable_advanced_preprocessing' 设置而导致的 KeyError。
+        """
+        if self.processing:
+            messagebox.showwarning("处理中", "当前正在进行其他操作，请稍候。")
+            return
+            
+        if not self.current_image_path:
+            messagebox.showwarning("未选择图片", "请先选择一张图片以预览其预处理效果。")
+            return
+
+        self.set_processing(True)
+        self.log_message(f"🔬 正在生成预处理预览: {os.path.basename(self.current_image_path)}", 'INFO')
+
+        # 收集所有相关的预处理设置
+        # --- 核心修正：移除了对不存在的 'enable_advanced_preprocessing' 的引用 ---
+        preprocess_options = {
+            'enable_preprocessing': True, # 预览时强制启用
+            'enable_advanced_segmentation': False, # 模拟纯文本识别流程以展示所有效果
+            # 'force_intensive_preprocessing' 键已移除
+            'enable_deskew': self.settings['enable_deskew'].get(),
+            'deskew_angle_threshold': self.settings['deskew_angle_threshold'].get(),
+            'remove_borders': self.settings['remove_borders'].get(),
+            'border_threshold': self.settings['border_threshold'].get(),
+            'crop_to_content': self.settings['crop_to_content'].get(),
+            'page_border_detection': self.settings['page_border_detection'].get(),
+            'shadow_removal': self.settings['shadow_removal'].get(),
+            # 'denoise_strength' 和 'edge_preservation' 在当前 image_processor 中未直接使用，但保留以备将来扩展
+            # 'denoise_strength': self.settings['denoise_strength'].get(),
+            # 'edge_preservation': self.settings['edge_preservation'].get(),
             'unsharp_mask': self.settings['unsharp_mask'].get(),
             'unsharp_radius': self.settings['unsharp_radius'].get(),
             'unsharp_amount': self.settings['unsharp_amount'].get(),
@@ -7206,82 +8648,356 @@ class EnhancedCVOCRGUI:
             'clahe_tile_grid_size': (self.settings['clahe_tile_grid_size_x'].get(), self.settings['clahe_tile_grid_size_y'].get()),
             'adaptive_block_size': self.settings['adaptive_block_size'].get(),
             'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
-            'psm': self.settings['psm_mode'].get(),
-            'confidence_threshold': self.settings['confidence_threshold'].get(),
-            'enable_layout_analysis': self.settings['enable_layout_analysis'].get(),
-            'enable_context_analysis': self.settings['enable_context_analysis'].get(),
-            'enable_super_resolution': self.settings['enable_super_resolution'].get(),
-            'enable_transformer_ocr': self.settings['enable_transformer_ocr'].get(),
-            'use_gpu': use_gpu
-        })
-        
-        async def recognition_worker_async(image_path_to_process, enable_preproc, force_intensive_preproc, lang, precision_lvl):
-            try:
-                self.cvocr_manager.language = lang
-                self.cvocr_manager.precision_level = precision_lvl
-                
-                init_tess_success, init_tess_msg = await self.loop.run_in_executor(
-                    self.async_ocr_processor.executor,
-                    self.cvocr_manager._initialize_tesseract # _initialize_tesseract 内部有 subprocess.run，是阻塞的
-                )
-                if not init_tess_success:
-                    self.log_message(f"❌ Tesseract引擎配置更新失败: {init_tess_msg}", 'ERROR')
-                    self.root.after(0, self.set_processing, False)
-                    self.root.after(0, messagebox.showerror, "识别失败", f"Tesseract引擎配置更新失败: {init_tess_msg}")
-                    return
+            'enable_grayscale': self.settings['enable_grayscale'].get(),
+            'enable_binarization': self.settings['enable_binarization'].get(),
+        }
 
-                # 调用 AsyncOCRProcessor 来执行阻塞的 OCR 任务
-                results, message = await self.async_ocr_processor.run_blocking_ocr_task(
-                    image_path_to_process,
-                    enable_preproc,
-                    precision_lvl # precision_override
+        async def preview_worker_async():
+            try:
+                # 在后台线程中运行阻塞的图像处理任务
+                task_to_run = functools.partial(
+                    self.image_processor.intelligent_preprocess_image,
+                    self.current_image_path,
+                    **preprocess_options
                 )
-                self.root.after(0, self._handle_recognition_result, image_path_to_process, results, message)
+                
+                processed_image_np, msg, metadata = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_to_run
+                )
+                
+                # 将结果回调到主线程以显示预览窗口
+                if processed_image_np is not None:
+                    original_image = Image.open(self.current_image_path)
+                    processed_image_pil = Image.fromarray(cv2.cvtColor(processed_image_np, cv2.COLOR_BGR2RGB))
+                    self.root.after(0, self._show_preprocessing_preview_window, original_image, processed_image_pil, metadata)
+                else:
+                    self.log_message(f"❌ 预处理预览生成失败: {msg}", 'ERROR')
+                    self.root.after(0, messagebox.showerror, "预览失败", f"生成预处理预览失败:\n{msg}")
+
             except Exception as e:
-                error_msg = f"识别图片 '{os.path.basename(image_path_to_process)}' 失败: {str(e)}\n{traceback.format_exc()}"
-                self.root.after(0, self._handle_recognition_result, image_path_to_process, None, error_msg)
+                error_msg = f"生成预处理预览时发生错误: {e}\n{traceback.format_exc()}"
+                self.log_message(f"❌ {error_msg}", 'ERROR')
+                self.root.after(0, messagebox.showerror, "预览失败", error_msg)
             finally:
                 self.root.after(0, self.set_processing, False)
-                self.root.after(0, self._update_performance_display)
+        
+        # 将异步任务提交到事件循环中
+        self.loop.call_soon_threadsafe(self.loop.create_task, preview_worker_async())
+    
+    
+    
+    
+    def preview_segmentation(self):
+        """
+        启动一个异步任务，以预览当前图像应用用户自定义的文本分割（切割）技术后的效果。
+        (V4.5 - 最终调用修正版)
+        """
+        if self.processing:
+            messagebox.showwarning("处理中", "当前正在进行其他操作，请稍候。")
+            return
+            
+        if not self.current_image_path:
+            messagebox.showwarning("未选择图片", "请先选择一张图片以预览其分割效果。")
+            return
+            
+        if not self.cvocr_manager.is_initialized or not self.cvocr_manager.text_detector:
+            messagebox.showerror("引擎未就绪", "CVOCR引擎或文本检测器未初始化，无法进行分割预览。")
+            return
 
-        # 提交异步任务到 asyncio 事件循环
-        self.loop.call_soon_threadsafe(self.loop.create_task, recognition_worker_async(
-            self.current_image_path, 
-            enable_preprocessing, 
-            force_intensive_preprocessing, 
-            language, 
-            precision_level
-        ))
+        self.set_processing(True)
+        self.log_message(f"📊 正在生成分割预览: {os.path.basename(self.current_image_path)}", 'INFO')
+
+        async def preview_worker_async():
+            try:
+                processed_image_np = None
+
+                if self._cached_preprocessed_image is not None:
+                    self.log_message("   - 步骤1: 检测到已缓存的预处理图像，直接使用。", 'INFO')
+                    processed_image_np = self._cached_preprocessed_image
+                else:
+                    self.log_message("   - 步骤1: 未找到缓存，正在实时应用图像预处理...", 'WARNING')
+                    preprocess_options = { key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)) }
+                    preprocess_options['enable_preprocessing'] = True
+
+                    task_preprocess = functools.partial(
+                        self.image_processor.intelligent_preprocess_image,
+                        self.current_image_path,
+                        **preprocess_options
+                    )
+                    processed_image_np, _, _ = await self.loop.run_in_executor(
+                        self.async_ocr_processor.executor, task_preprocess
+                    )
+
+                if processed_image_np is None:
+                    raise Exception("图像预处理失败，无法继续进行分割。")
+                
+                self.log_message(f"   - 步骤2: 使用用户自定义技术组合进行文本检测...", 'INFO')
+                
+                enabled_algorithms = self._get_enabled_segmentation_algorithms()
+                if not enabled_algorithms:
+                     raise Exception("没有选择任何分割技术。请在'高级文本分割技术'区域勾选至少一项。")
+                
+                if len(processed_image_np.shape) == 2:
+                    image_for_detection = cv2.cvtColor(processed_image_np, cv2.COLOR_GRAY2BGR)
+                else:
+                    image_for_detection = processed_image_np
+
+                # --- 核心修正：采用“先更新配置，再调用”的统一模式 ---
+                
+                # 1. 收集并更新检测器的内部配置
+                current_config = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+                self.cvocr_manager.text_detector.config.update(current_config)
+                
+                # 2. 准备不带 precision_level 参数的调用
+                task_detect = functools.partial(
+                    self.cvocr_manager.text_detector.detect_text_regions_advanced,
+                    image_for_detection,
+                    enabled_algorithms
+                )
+                regions, metadata = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor, task_detect
+                )
+                
+                self.log_message(f"   - 步骤3: 检测到 {len(regions)} 个文本区域，正在生成可视化...", 'INFO')
+                
+                task_draw = functools.partial(
+                    self._draw_segmentation_on_image,
+                    self.current_image_path,
+                    regions,
+                    processed_image_np
+                )
+                original_pil, processed_pil_with_boxes = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor, task_draw
+                )
+
+                self.root.after(0, self._show_segmentation_preview_window, original_pil, processed_pil_with_boxes, metadata)
+
+            except Exception as e:
+                error_msg = f"生成分割预览时发生错误: {e}"
+                logger.error(f"{error_msg}\n{traceback.format_exc()}", exc_info=True)
+                self.log_message(f"❌ {error_msg}", 'ERROR')
+                self.root.after(0, messagebox.showerror, "预览失败", error_msg)
+            finally:
+                self.root.after(0, self.set_processing, False)
+
+        self.loop.call_soon_threadsafe(self.loop.create_task, preview_worker_async())
+    
+    def _draw_segmentation_on_image(self, image_path: str, regions: List[np.ndarray], processed_image_np: np.ndarray) -> Tuple[Image.Image, Image.Image]:
+        """
+        加载原始图像，并在预处理后的图像副本上绘制分割区域。
+        这是一个辅助方法，设计为在后台线程中运行。
+
+        Args:
+            image_path (str): 原始图像的文件路径，用于在预览窗口左侧显示。
+            regions (List[np.ndarray]): 检测到的文本区域（分割框）列表。
+            processed_image_np (np.ndarray): 经过预处理后的图像NumPy数组，将在此图像上绘制分割框。
+
+        Returns:
+            Tuple[Image.Image, Image.Image]: 一个包含两个PIL图像的元组：
+                                             1. 原始图像。
+                                             2. 带有分割框的预处理后图像。
+        """
+        # 加载原始图像用于左侧显示
+        original_image_np = cv2.imread(image_path)
+        original_pil = Image.fromarray(cv2.cvtColor(original_image_np, cv2.COLOR_BGR2RGB))
+        
+        # 使用传入的、已预处理的图像作为绘制的画布
+        # 首先确保它是RGB格式以便PIL处理
+        if len(processed_image_np.shape) == 2: # 如果是灰度图
+            image_with_regions = cv2.cvtColor(processed_image_np, cv2.COLOR_GRAY2RGB)
+        else: # 如果是BGR图
+            image_with_regions = cv2.cvtColor(processed_image_np, cv2.COLOR_BGR2RGB)
+        
+        # 绘制所有检测到的多边形区域
+        if regions:
+            # 将所有区域点转换为适用于 polylines 的整数坐标格式
+            pts = [np.array(region, np.int32) for region in regions]
+            # 在图像上绘制所有多边形，颜色为亮绿色，线宽为2像素
+            cv2.polylines(image_with_regions, pts, isClosed=True, color=(0, 255, 0), thickness=2)
+            
+        # 将绘制后的 NumPy 数组转为 PIL 图像，用于在预览窗口右侧显示
+        segmented_pil = Image.fromarray(image_with_regions)
+        
+        return original_pil, segmented_pil
+
+    def _show_segmentation_preview_window(self, original_img: Image.Image, segmented_processed_img: Image.Image, metadata: Dict):
+        """
+        创建一个新窗口来并排显示原始图像和带有分割结果的预处理后图像。
+        (V4.3 - 工作流修正版): 
+        - 左侧显示原始图，用于基准对比。
+        - 右侧显示在预处理后的图像上绘制的分割框，直观展示预处理+分割的联合效果。
+        - 底部显示本次操作所使用的具体分割算法组合。
+        """
+        preview_window = tk.Toplevel(self.root)
+        preview_window.title("文本分割（切割）效果预览")
+        preview_window.geometry("1600x800")
+        preview_window.transient(self.root)
+        preview_window.grab_set()
+
+        main_frame = ttk.Frame(preview_window, padding=design.get_spacing('4'))
+        main_frame.pack(fill='both', expand=True)
+
+        # 图像显示区
+        image_frame = ttk.Frame(main_frame)
+        image_frame.pack(fill='both', expand=True)
+
+        # 左侧：原始图像
+        original_frame = ttk.LabelFrame(image_frame, text="原始图像", padding=design.get_spacing('2'))
+        original_frame.pack(side='left', fill='both', expand=True, padx=(0, design.get_spacing('2')))
+        original_canvas = tk.Canvas(original_frame, bg=design.get_color('neutral', '100'))
+        original_canvas.pack(fill='both', expand=True)
+
+        # 右侧：预处理 + 分割结果
+        segmented_frame = ttk.LabelFrame(image_frame, text="预处理 + 分割结果 (绿色框)", padding=design.get_spacing('2'))
+        segmented_frame.pack(side='right', fill='both', expand=True, padx=(design.get_spacing('2'), 0))
+        segmented_canvas = tk.Canvas(segmented_frame, bg=design.get_color('neutral', '100'))
+        segmented_canvas.pack(fill='both', expand=True)
+
+        # 底部信息区
+        info_frame = ttk.LabelFrame(main_frame, text="检测信息", padding=design.get_spacing('3'))
+        info_frame.pack(fill='x', pady=(design.get_spacing('4'), 0))
+
+        # 显示元数据
+        total_regions = metadata.get('total_regions', 0)
+        proc_time = metadata.get('processing_time', 0.0)
+        # 从元数据中获取实际使用的算法列表
+        algorithms_used = ", ".join(metadata.get('algorithms_used', ['N/A']))
+        
+        info_text = f"使用算法: {algorithms_used} | 检测到区域数: {total_regions} | 耗时: {proc_time:.3f} 秒"
+        info_label = tk.Label(info_frame, text=info_text, justify='left', bg=design.get_color('neutral', '50'))
+        design.apply_text_style(info_label, 'body')
+        info_label.pack(anchor='w')
+
+        # 动态调整图片大小以适应Canvas的函数
+        def resize_and_display(canvas: tk.Canvas, img: Image.Image):
+            canvas.update_idletasks()
+            canvas_w, canvas_h = canvas.winfo_width(), canvas.winfo_height()
+            if canvas_w <= 1 or canvas_h <= 1: return
+            
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            
+            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            
+            # 存储引用防止被垃圾回收
+            canvas.image = photo
+            
+            x_offset = (canvas_w - new_w) // 2
+            y_offset = (canvas_h - new_h) // 2
+            canvas.create_image(x_offset, y_offset, image=photo, anchor='nw')
+
+        # 延迟绑定resize事件，确保窗口已创建
+        preview_window.after(100, lambda: [
+            resize_and_display(original_canvas, original_img),
+            resize_and_display(segmented_canvas, segmented_processed_img),
+            original_canvas.bind('<Configure>', lambda e: resize_and_display(original_canvas, original_img)),
+            segmented_canvas.bind('<Configure>', lambda e: resize_and_display(segmented_canvas, segmented_processed_img))
+        ])
+
+        self.log_message("✅ 成功生成分割预览窗口。", 'SUCCESS')
+
+
+    def _show_preprocessing_preview_window(self, original_img: Image.Image, processed_img: Image.Image, metadata: Dict):
+        """
+        创建一个新窗口来并排显示原始图像和预处理后的图像。
+        (V4.3 - 缓存结果版): 此版本在显示预览的同时，会将处理后的图像缓存到实例变量中，
+        以供“预览分割结果”功能直接使用，实现工作流的无缝衔接。
+        """
+        preview_window = tk.Toplevel(self.root)
+        preview_window.title("图像预处理效果预览")
+        preview_window.geometry("1600x800")
+        preview_window.transient(self.root)
+        preview_window.grab_set()
+
+        main_frame = ttk.Frame(preview_window, padding=design.get_spacing('4'))
+        main_frame.pack(fill='both', expand=True)
+
+        # 图像显示区
+        image_frame = ttk.Frame(main_frame)
+        image_frame.pack(fill='both', expand=True)
+
+        # 原始图像
+        original_frame = ttk.LabelFrame(image_frame, text="原始图像", padding=design.get_spacing('2'))
+        original_frame.pack(side='left', fill='both', expand=True, padx=(0, design.get_spacing('2')))
+        original_canvas = tk.Canvas(original_frame, bg=design.get_color('neutral', '100'))
+        original_canvas.pack(fill='both', expand=True)
+
+        # 预处理后图像
+        processed_frame = ttk.LabelFrame(image_frame, text="预处理后", padding=design.get_spacing('2'))
+        processed_frame.pack(side='right', fill='both', expand=True, padx=(design.get_spacing('2'), 0))
+        processed_canvas = tk.Canvas(processed_frame, bg=design.get_color('neutral', '100'))
+        processed_canvas.pack(fill='both', expand=True)
+
+        # 底部信息区
+        info_frame = ttk.LabelFrame(main_frame, text="处理信息", padding=design.get_spacing('3'))
+        info_frame.pack(fill='x', pady=(design.get_spacing('4'), 0))
+
+        # 显示处理步骤
+        operations = metadata.get('operations', ['无操作'])
+        operations_text = " -> ".join(operations)
+        info_label = tk.Label(info_frame, text=f"处理流程: {operations_text}", 
+                              wraplength=1500, justify='left', bg=design.get_color('neutral', '50'))
+        design.apply_text_style(info_label, 'body_small')
+        info_label.pack(anchor='w')
+
+        # 动态调整图片大小以适应Canvas
+        def resize_and_display(canvas: tk.Canvas, img: Image.Image):
+            canvas.update_idletasks() # 确保获取到正确的canvas尺寸
+            canvas_w, canvas_h = canvas.winfo_width(), canvas.winfo_height()
+            if canvas_w <= 1 or canvas_h <= 1: return
+            
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            
+            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            
+            # 存储引用防止被垃圾回收
+            canvas.image = photo 
+            
+            # 在Canvas中央显示图片
+            x_offset = (canvas_w - new_w) // 2
+            y_offset = (canvas_h - new_h) // 2
+            canvas.create_image(x_offset, y_offset, image=photo, anchor='nw')
+
+        # 延迟绑定resize事件，确保窗口已创建
+        preview_window.after(100, lambda: [
+            resize_and_display(original_canvas, original_img),
+            resize_and_display(processed_canvas, processed_img),
+            original_canvas.bind('<Configure>', lambda e: resize_and_display(original_canvas, original_img)),
+            processed_canvas.bind('<Configure>', lambda e: resize_and_display(processed_canvas, processed_img))
+        ])
+
+        # 将处理后的图像（PIL.Image）转换为NumPy数组（BGR格式）并缓存
+        # 这是实现“预处理 -> 分割预览”工作流衔接的关键步骤
+        self._cached_preprocessed_image = cv2.cvtColor(np.array(processed_img), cv2.COLOR_RGB2BGR)
+        self.log_message("✅ 成功生成预处理预览窗口，并已缓存处理结果。", 'SUCCESS')
+    
+    
     def _handle_recognition_result(self, image_path: str, results: Optional[Dict], message: str):
         """
-        处理识别结果，更新GUI的各个部分 (V3.14 坐标对齐最终版)。
-        这是所有异步识别任务的最终回调函数，在Tkinter主线程中执行。
-        它负责：
-        1. 处理成功或失败的识别结果。
-        2. 将结果添加到历史记录和结果管理器。
-        3. 更新“识别结果”表格、“识别报告”文本区。
-        4. 调用display_image方法，在图片上绘制与文字精确对齐的边界框。
-        5. 刷新历史和统计信息。
+        处理识别结果，并全面更新GUI的各个部分。
         """
         try:
-            # --- 1. 处理失败情况 ---
             if results is None or results.get('error'):
                 self.log_message(f"❌ 识别失败: {message}", 'ERROR')
                 messagebox.showerror("识别失败", f"识别图片 '{os.path.basename(image_path)}' 失败:\n{message}")
                 
-                # 清理界面显示
                 self.report_text.config(state='normal')
                 self.report_text.delete(1.0, tk.END)
                 self.report_text.insert(tk.END, f"识别失败: {message}")
                 self.report_text.config(state='disabled')
+                
                 self.results_tree.delete(*self.results_tree.get_children())
                 self.results_stats_label.config(text="识别失败")
 
-                # 即使失败，也添加一条记录到历史，便于追踪问题
                 fail_results_entry = {
                     'full_text': '', 'text_blocks': [], 'error': message,
                     'total_blocks': 0, 'total_characters': 0, 'average_confidence': 0,
-                    'precision_level': self.settings['precision_level'].get(),
                     'language': self.settings['language'].get(),
                     'cvocr_components': self.cvocr_manager.config.get('components', {}),
                     'processing_metadata': {'total_processing_time': 0, 'error': message}
@@ -7289,10 +9005,8 @@ class EnhancedCVOCRGUI:
                 self.result_manager.add_result(image_path, fail_results_entry, fail_results_entry.get('processing_metadata'))
                 return
 
-            # --- 2. 处理成功情况 ---
             self.log_message(f"✅ 识别成功: {message}", 'SUCCESS')
             
-            # 2.1 添加到结果管理器并处理自动保存
             entry = self.result_manager.add_result(image_path, results, results.get('processing_metadata'))
             if entry and self.settings['auto_save_results'].get():
                 try:
@@ -7306,52 +9020,47 @@ class EnhancedCVOCRGUI:
                 except Exception as e:
                     self.log_message(f"❌ 自动保存结果失败: {e}", 'ERROR')
 
-            # 2.2 更新“识别报告”标签页的纯文本内容
             self.report_text.config(state='normal')
             self.report_text.delete(1.0, tk.END)
             self.report_text.insert(tk.END, results.get('full_text', ''))
             self.report_text.config(state='disabled')
 
-            # 2.3 更新“识别结果”标签页的详细表格
             self.results_tree.delete(*self.results_tree.get_children())
-            text_blocks = results.get('text_blocks', [])
+            all_blocks = results.get('text_blocks', [])
             
-            for i, block in enumerate(text_blocks):
-                confidence_str = f"{block.get('confidence', 0):.1f}%" if self.settings['show_confidence'].get() else ""
+            for i, block in enumerate(all_blocks):
+                confidence_str = f"{block.get('confidence', 0):.1f}%"
                 bbox = block.get('bbox', [0,0,0,0])
                 bbox_str = f"({bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]})"
                 
-                # 获取本次识别使用的组件信息
-                components_from_entry = entry.get('cvocr_components', {}) 
-                used_components = [k.replace('_used', '') for k, v in components_from_entry.items() if v]
-                components_str = "+".join(used_components) if used_components else 'Tesseract'
-                
-                layout_info_str = block.get('layout_info', {}).get('region_type', 'N/A')
+                if block.get('is_shape', False):
+                    components_str = "图形检测"
+                    text_display = block.get('text', '')
+                    layout_info_str = 'N/A'
+                else:
+                    text_display = block.get('text', '')[:50] + "..." if len(block.get('text', '')) > 50 else block.get('text', '')
+                    components_from_entry = entry.get('cvocr_components', {}) 
+                    used_components = [k.replace('_used', '') for k, v in components_from_entry.items() if v]
+                    components_str = "+".join(used_components) if used_components else 'Tesseract'
+                    layout_info_str = block.get('layout_info', {}).get('region_type', 'N/A')
                 
                 self.results_tree.insert('', 'end', values=(
-                    i + 1,
-                    block.get('text', '')[:50] + "..." if len(block.get('text', '')) > 50 else block.get('text', ''),
-                    confidence_str,
-                    bbox_str,
-                    block.get('line_num', 0),
-                    block.get('block_num', 0),
-                    components_str,
-                    layout_info_str
+                    i + 1, text_display, confidence_str, bbox_str,
+                    block.get('line_num', 0), block.get('block_num', 0),
+                    components_str, layout_info_str
                 ), iid=f"block_{i}")
 
-            # 2.4 更新结果统计标签
             total_char_count = results.get('total_characters', 0)
             avg_confidence_display = results.get('average_confidence', 0)
-            self.results_stats_label.config(text=f"总文本块: {len(text_blocks)} | 总字符: {total_char_count} | 平均置信度: {avg_confidence_display:.1f}%")
+            self.results_stats_label.config(text=f"总元素块: {len(all_blocks)} | 总字符: {total_char_count} | 平均置信度: {avg_confidence_display:.1f}%")
 
-            # --- 3. 【核心修正】调用新的 display_image 方法，并传入 text_blocks 以绘制对齐的边界框 ---
-            self.display_image(image_path, text_blocks=text_blocks)
+            text_blocks_to_draw = [b for b in all_blocks if not b.get('is_shape', False)]
+            shape_blocks_to_draw = [b for b in all_blocks if b.get('is_shape', False)]
+            self.display_image(image_path, text_blocks=text_blocks_to_draw, shape_blocks=shape_blocks_to_draw)
             
-            # --- 4. 更新其他相关的GUI部分 ---
             self.refresh_history()
             self.update_enhanced_stats()
 
-            # 切换到“识别结果”标签页，让用户首先看到详细数据
             self.notebook.select(1)
             self.root.update_idletasks()
 
@@ -7360,9 +9069,10 @@ class EnhancedCVOCRGUI:
             self.log_message(f"❌ {error_msg}", 'ERROR')
             messagebox.showerror("GUI更新失败", error_msg)
         finally:
-            # 确保在所有操作（无论成功或失败）后，都将处理状态设置为False
             self.set_processing(False)
             self._update_performance_display()
+    
+    
     def batch_process(self):
         """批量处理多个图片文件 (现在是异步协程)"""
         if self.processing:
@@ -7384,19 +9094,15 @@ class EnhancedCVOCRGUI:
         self.set_processing(True)
         self.log_message(f"⚡ 开始批量识别 {len(self.batch_image_paths)} 张图片...", 'INFO')
 
+       
         language_str = self.settings['language'].get()
         language = OCRLanguage(language_str) if language_str != 'auto' else OCRLanguage.AUTO
-        precision_level_str = self.settings['precision_level'].get()
-        precision_level = OCRPrecisionLevel(precision_level_str)
         enable_preprocessing = self.settings['enable_preprocessing'].get()
-        force_intensive_preprocessing = self.settings['enable_advanced_preprocessing'].get()
         use_gpu = self.settings['use_gpu'].get()
 
         self.cvocr_manager.config.update({
             'language': language.value,
-            'precision_level': precision_level.value,
             'enable_preprocessing_optimization': enable_preprocessing,
-            'force_intensive_preprocessing': force_intensive_preprocessing,
             'use_gpu': use_gpu,
             'enable_deskew': self.settings['enable_deskew'].get(),
             'deskew_angle_threshold': self.settings['deskew_angle_threshold'].get(),
@@ -7405,8 +9111,6 @@ class EnhancedCVOCRGUI:
             'crop_to_content': self.settings['crop_to_content'].get(),
             'page_border_detection': self.settings['page_border_detection'].get(),
             'shadow_removal': self.settings['shadow_removal'].get(),
-            'denoise_strength': self.settings['denoise_strength'].get(),
-            'edge_preservation': self.settings['edge_preservation'].get(),
             'unsharp_mask': self.settings['unsharp_mask'].get(),
             'unsharp_radius': self.settings['unsharp_radius'].get(),
             'unsharp_amount': self.settings['unsharp_amount'].get(),
@@ -7424,12 +9128,10 @@ class EnhancedCVOCRGUI:
             'confidence_threshold': self.settings['confidence_threshold'].get(),
             'enable_layout_analysis': self.settings['enable_layout_analysis'].get(),
             'enable_context_analysis': self.settings['enable_context_analysis'].get(),
-            'enable_super_resolution': self.settings['enable_super_resolution'].get(),
             'enable_transformer_ocr': self.settings['enable_transformer_ocr'].get(),
         })
 
         self.cvocr_manager.language = language
-        self.cvocr_manager.precision_level = precision_level
         
         async def batch_process_async():
             init_tess_success, init_tess_msg = await self.loop.run_in_executor(
@@ -7444,32 +9146,33 @@ class EnhancedCVOCRGUI:
 
             tasks = []
             for i, image_path_to_process in enumerate(self.batch_image_paths):
-                # 创建异步任务，每个任务调用 AsyncOCRProcessor 执行阻塞的 OCR
                 task = self.async_ocr_processor.run_blocking_ocr_task(
                     image_path_to_process,
-                    enable_preprocessing,
-                    precision_level
+                    enable_preprocessing
                 )
                 tasks.append(task)
             
-            # 异步地等待所有任务完成，并处理结果
             completed_count = 0
             total_count = len(tasks)
-            for future in asyncio.as_completed(tasks):
+            # 使用 enumerate 来同时获取索引和 future 对象
+            for i, future in enumerate(asyncio.as_completed(tasks)):
                 completed_count += 1
+                # 从原始列表中获取对应的图片路径
+                image_path_for_result = self.batch_image_paths[i]
                 try:
                     results, message = await future
-                    self.root.after(0, self._handle_batch_result, image_path_to_process, results, message, completed_count, total_count)
+                    self.root.after(0, self._handle_batch_result, image_path_for_result, results, message, completed_count, total_count)
                 except Exception as e:
-                    error_msg = f"批量识别图片 '{os.path.basename(image_path_to_process)}' 失败: {str(e)}\n{traceback.format_exc()}"
+                    error_msg = f"批量识别图片 '{os.path.basename(image_path_for_result)}' 失败: {str(e)}\n{traceback.format_exc()}"
                     self.log_message(f"❌ [{completed_count}/{total_count}] {error_msg}", 'ERROR')
-                    self.root.after(0, self._handle_batch_result, image_path_to_process, None, error_msg, completed_count, total_count) # 仍然记录失败结果
+                    self.root.after(0, self._handle_batch_result, image_path_for_result, None, error_msg, completed_count, total_count)
 
             self.log_message(f"✅ 批量处理完成！共处理 {total_count} 张图片。", 'SUCCESS')
             self.root.after(0, self.set_processing, False)
             self.root.after(0, self._update_performance_display)
 
         self.loop.call_soon_threadsafe(self.loop.create_task, batch_process_async())
+    
     def _handle_batch_result(self, image_path: str, results: Optional[Dict], message: str, completed_count: int, total_count: int):
         """处理批量识别中的单个结果，更新GUI和历史记录"""
         progress_msg = f"⚡ [{completed_count}/{total_count}]"
@@ -7479,7 +9182,6 @@ class EnhancedCVOCRGUI:
             fail_results = {
                 'full_text': '', 'text_blocks': [], 'error': message,
                 'total_blocks': 0, 'total_characters': 0, 'average_confidence': 0,
-                'precision_level': self.settings['precision_level'].get(),
                 'language': self.settings['language'].get(),
                 'cvocr_components': self.cvocr_manager.config.get('components', {}),
                 'processing_metadata': {'total_processing_time': 0, 'error': message}
@@ -7515,38 +9217,34 @@ class EnhancedCVOCRGUI:
 
         language_str = self.settings['language'].get()
         language = OCRLanguage(language_str) if language_str != 'auto' else OCRLanguage.AUTO
-        precision_level = OCRPrecisionLevel.FAST # 快速OCR强制使用快速模式
         
-        self.cvocr_manager.config.update({
+        # 【最终强化】: 创建一个干净、独立的配置字典用于快速OCR，确保不受任何其他设置的干扰。
+        quick_config = {
             'language': language.value,
-            'precision_level': precision_level.value,
-            'enable_preprocessing_optimization': False,
-            'force_intensive_preprocessing': False,
-            'enable_deskew': False,
-            'remove_borders': False,
-            'crop_to_content': False,
-            'page_border_detection': False,
-            'shadow_removal': False,
-            'denoise_strength': 0.0,
-            'unsharp_mask': False,
-            'histogram_equalization': False,
-            'bilateral_filter': False,
-            'apply_clahe': False,
-            'psm': 7,
-            'oem': 3,
-            'confidence_threshold': 0,
+            'psm': 3,  # 使用PSM 3进行整页自动分割，最符合快速端到端识别的逻辑。
+            'oem': 3,  # 使用默认的LSTM引擎。
+            'confidence_threshold': 0, # 在快速模式下，我们希望看到所有结果，不过滤。
+            'use_gpu': self.settings['use_gpu'].get(),
+            'quick_mode': True, # <--- 新增：添加一个明确的“快速模式”标记
+
+            # --- 显式禁用所有高级功能 ---
+            'enable_preprocessing': False, # 禁用所有在AdvancedTextImageProcessor中的复杂预处理。
+            'enable_preprocessing_optimization': False, # 确保manager也知道预处理已禁用。
+            'enable_advanced_segmentation': False, # 强制关闭全元素检测/高级分割模式。
             'enable_layout_analysis': False,
             'enable_context_analysis': False,
-            'enable_super_resolution': False,
             'enable_transformer_ocr': False,
-            'use_gpu': self.settings['use_gpu'].get()
-        })
-        
+            'enable_smart_line_merge': False,
+            'enable_layoutlm_merge': False,
+        }
+
+        # 将这个干净的配置应用到管理器
+        self.cvocr_manager.config.update(quick_config)
         self.cvocr_manager.language = language
-        self.cvocr_manager.precision_level = precision_level
         
-        async def quick_ocr_worker_async(image_path_to_process, lang, precision_lvl):
+        async def quick_ocr_worker_async(image_path_to_process, lang):
             try:
+                # 重新初始化Tesseract配置，以确保使用PSM 3
                 init_tess_success, init_tess_msg = await self.loop.run_in_executor(
                     self.async_ocr_processor.executor,
                     self.cvocr_manager._initialize_tesseract
@@ -7557,10 +9255,10 @@ class EnhancedCVOCRGUI:
                     self.root.after(0, messagebox.showerror, "快速OCR失败", f"Tesseract引擎配置更新失败: {init_tess_msg}")
                     return
 
+                # 调用核心识别函数，第二个参数 `enable_preprocessing` 为 False
                 results, message = await self.async_ocr_processor.run_blocking_ocr_task(
                     image_path_to_process,
-                    False, # 明确禁用高级预处理
-                    precision_lvl
+                    False 
                 )
                 self.root.after(0, self._handle_recognition_result, image_path_to_process, results, message)
             except Exception as e:
@@ -7570,7 +9268,9 @@ class EnhancedCVOCRGUI:
                 self.root.after(0, self.set_processing, False)
                 self.root.after(0, self._update_performance_display)
 
-        self.loop.call_soon_threadsafe(self.loop.create_task, quick_ocr_worker_async(self.current_image_path, language, precision_level))
+        self.loop.call_soon_threadsafe(self.loop.create_task, quick_ocr_worker_async(self.current_image_path, language))
+    
+    
     def show_visualization(self):
         """显示当前识别结果的边界框可视化"""
         if not self.result_manager.current_results:
@@ -8259,55 +9959,61 @@ class EnhancedCVOCRGUI:
             return
 
         selected_block = current_results_data['text_blocks'][idx]
-        bbox = selected_block['bbox']
+        bbox = selected_block.get('bbox')
+        
+        # --- 核心修正开始 ---
+        # 增加对 bbox 和关键实例变量的检查
+        if not bbox or len(bbox) != 4:
+             self.log_message(f"无法高亮：文本块 '{selected_block['text'][:20]}...' 缺少有效的边界框信息。", "WARNING")
+             return
+             
+        if not hasattr(self, '_last_display_scale_ratio_x') or \
+           not hasattr(self, '_last_display_x_offset'):
+            self.log_message("无法高亮：缺少图像显示参数。请确保图片已正确显示。", "WARNING")
+            return
+        
+        # 清除旧的高亮框
+        self.image_canvas.delete("highlight_bbox")
 
-        # 重新绘制图片，并高亮选中区域
-        self.display_image(self.current_image_path) # 先清除旧高亮
+        # 从实例变量获取显示参数
+        scale_ratio_x = self._last_display_scale_ratio_x
+        scale_ratio_y = self._last_display_scale_ratio_y
+        x_offset = self._last_display_x_offset
+        y_offset = self._last_display_y_offset
+
+        # 转换原始坐标到画布坐标
+        x1_orig, y1_orig, x2_orig, y2_orig = bbox
+        x1_canvas = int(x1_orig * scale_ratio_x + x_offset)
+        y1_canvas = int(y1_orig * scale_ratio_y + y_offset)
+        x2_canvas = int(x2_orig * scale_ratio_x + x_offset)
+        y2_canvas = int(y2_orig * scale_ratio_y + y_offset)
         
-        # 获取当前图片在Canvas上的缩放比例和偏移
-        if not self.photo or not self._last_original_image_size: return # <--- 修正11: 确保有图片和原始尺寸信息
+        # 绘制高亮矩形框
+        self.image_canvas.create_rectangle(
+            x1_canvas, y1_canvas, x2_canvas, y2_canvas, 
+            outline='blue', width=3, tags="highlight_bbox"
+        )
         
+        # --- 滚动逻辑保持不变，但基于正确的坐标 ---
         canvas_width = self.image_canvas.winfo_width()
         canvas_height = self.image_canvas.winfo_height()
         
-        # Use stored scale ratios from display_image
-        scale_ratio_x = self._last_display_scale_ratio_x
-        scale_ratio_y = self._last_display_scale_ratio_y
-        
-        # Recalculate displayed image dimensions on canvas
-        original_img_width, original_img_height = self._last_original_image_size
-        display_width = int(original_img_width * scale_ratio_x)
-        display_height = int(original_img_height * scale_ratio_y)
+        if self._last_original_image_size:
+            original_img_width, original_img_height = self._last_original_image_size
+            display_width = int(original_img_width * scale_ratio_x)
+            display_height = int(original_img_height * scale_ratio_y)
+            
+            # 确保 display_width 和 display_height 不为零
+            if display_width > 0 and display_height > 0:
+                scroll_x = (x1_canvas + (x2_canvas - x1_canvas) / 2 - canvas_width / 2) / display_width
+                scroll_y = (y1_canvas + (y2_canvas - y1_canvas) / 2 - canvas_height / 2) / display_height
+                
+                scroll_x = max(0.0, min(1.0, scroll_x))
+                scroll_y = max(0.0, min(1.0, scroll_y))
 
-        # Calculate offsets (assuming image is centered)
-        x_offset = (canvas_width - display_width) / 2
-        y_offset = (canvas_height - display_height) / 2
-
-        # Scale bbox coordinates
-        x1, y1, x2, y2 = bbox
-        x1_scaled = int(x1 * scale_ratio_x + x_offset)
-        y1_scaled = int(y1 * scale_ratio_y + y_offset)
-        x2_scaled = int(x2 * scale_ratio_x + x_offset)
-        y2_scaled = int(y2 * scale_ratio_y + y_offset)
-
-        # Draw a highlighted rectangle
-        self.image_canvas.create_rectangle(x1_scaled, y1_scaled, x2_scaled, y2_scaled, 
-                                           outline='blue', width=3, tags="highlight_bbox")
-        
-        # Scroll canvas to show the highlighted area if needed
-        # Calculate the scroll positions as fractions of the full scrollable area
-        # The scrollable area is from x_offset to x_offset + display_width
-        # And from y_offset to y_offset + display_height
-        # Scroll to center the highlighted bbox roughly
-        scroll_x = (x1_scaled + (x2_scaled - x1_scaled) / 2 - canvas_width / 2) / (display_width)
-        scroll_y = (y1_scaled + (y2_scaled - y1_scaled) / 2 - canvas_height / 2) / (display_height)
-        
-        # Ensure scroll values are within [0, 1]
-        scroll_x = max(0.0, min(1.0, scroll_x))
-        scroll_y = max(0.0, min(1.0, scroll_y))
-
-        self.image_canvas.xview_moveto(scroll_x)
-        self.image_canvas.yview_moveto(scroll_y)
+                self.image_canvas.xview_moveto(scroll_x)
+                self.image_canvas.yview_moveto(scroll_y)
+        # --- 核心修正结束 ---
 
         self.log_message(f"高亮显示文本块: {selected_block['text'][:20]}...", 'INFO')
         self.notebook.select(0) # 切换到图片预览
@@ -8372,29 +10078,355 @@ class EnhancedCVOCRGUI:
         else:
             self.log_message(f"❌ {message}", 'ERROR')
             messagebox.showerror("生成失败", message)
+    def preview_region_preprocessing(self):
+        """启动一个异步任务，以预览单个文本区域的精细化预处理效果。"""
+        if self.processing:
+            messagebox.showwarning("处理中", "当前正在进行其他操作，请稍候。")
+            return
+        if not self.current_image_path:
+            messagebox.showwarning("未选择图片", "请先选择一张图片。")
+            return
+        if not self.cvocr_manager.is_initialized or not self.cvocr_manager.text_detector:
+            messagebox.showerror("引擎未就绪", "请先初始化CVOCR引擎。")
+            return
 
+        self.set_processing(True)
+        self.log_message("🔬 正在生成区域预处理预览...", 'INFO')
 
+        async def preview_worker_async():
+            try:
+                # 步骤1: 获取预处理后的整张图
+                preprocess_options = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+                
+                task_preprocess = functools.partial(
+                    self.image_processor.intelligent_preprocess_image,
+                    self.current_image_path,
+                    **preprocess_options
+                )
+                processed_image_np, _, _ = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_preprocess
+                )
+
+                if processed_image_np is None: 
+                    raise Exception("图像预处理失败。")
+
+                # 步骤2: 在预处理图上进行分割，找到区域
+                enabled_algorithms = self._get_enabled_segmentation_algorithms()
+                if not enabled_algorithms: 
+                    raise Exception("请至少选择一种高级分割技术。")
+                
+                current_config = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+
+                self.cvocr_manager.text_detector.config.update(current_config)
+                
+                task_detect = functools.partial(
+                    self.cvocr_manager.text_detector.detect_text_regions_advanced,
+                    processed_image_np, 
+                    enabled_algorithms
+                )
+                regions, _ = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_detect
+                )
+                
+                if not regions:
+                    self.log_message("⚠️ 预览中止：使用当前分割技术未检测到任何文本区域。", "WARNING")
+                    self.root.after(0, messagebox.showwarning, "预览中止", 
+                                    "使用当前选择的高级分割技术未能在此图片上检测到任何文本区域。\n\n"
+                                    "请尝试：\n"
+                                    "1. 勾选不同的分割技术（如“改进MSER”）。\n"
+                                    "2. 调整“高级设置”中的预处理选项。\n"
+                                    "3. 点击“预览分割结果”查看整体分割效果。")
+                    return
+
+                # 步骤3: 选取第一个区域并进行精细化预处理
+                region_box = regions[0]
+                rect = cv2.minAreaRect(region_box)
+                center, (width, height), angle = rect
+
+                # --- 最终版智能旋转逻辑 ---
+                # 步骤1: 确保 width >= height，标准化矩形描述
+                if width < height:
+                    width, height = height, width
+                    swapped = True
+                else:
+                    swapped = False
+                
+                # 步骤2: 仅当矩形原本是瘦长的垂直形状时，才应用90度旋转校正
+                aspect_ratio = width / height if height > 0 else 0
+                if swapped and aspect_ratio > 1.5:
+                    angle += 90
+                # --- 逻辑结束 ---
+
+                width, height = int(width), int(height)
+                
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                warped_bgr = cv2.warpAffine(processed_image_np, M, (processed_image_np.shape[1], processed_image_np.shape[0]))
+                cropped_bgr = cv2.getRectSubPix(warped_bgr, (width, height), center)
+
+                if cropped_bgr is None or cropped_bgr.size == 0:
+                    raise Exception("无法从图像中切割出有效的文本区域。")
+                
+                # 应用精细化预处理
+                gray_cropped = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2GRAY)
+                h, w = gray_cropped.shape
+                if h > 0 and (h < 24 or h > 64):
+                    scale = 40.0 / h
+                    gray_cropped = cv2.resize(gray_cropped, (0,0), fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+                
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+                enhanced = clahe.apply(gray_cropped)
+                _, binarized = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                bordered = cv2.copyMakeBorder(binarized, 8, 8, 8, 8, cv2.BORDER_CONSTANT, value=[255])
+                
+                original_region_pil = Image.fromarray(cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB))
+                processed_region_pil = Image.fromarray(bordered)
+
+                self.root.after(0, self._show_region_preview_window, original_region_pil, processed_region_pil)
+
+            except Exception as e:
+                logger.error(f"生成区域预处理预览时发生异常: {e}", exc_info=True)
+                self.root.after(0, messagebox.showerror, "预览失败", f"生成预览失败: {e}\n\n请检查日志获取详细信息。")
+            finally:
+                self.root.after(0, self.set_processing, False)
+
+        self.loop.call_soon_threadsafe(self.loop.create_task, preview_worker_async())
+    
+    
+    def _show_region_preview_window(self, original_region: Image.Image, processed_region: Image.Image):
+        """创建一个新窗口来对比显示单个文本区域的预处理前后效果。"""
+        preview_window = tk.Toplevel(self.root)
+        preview_window.title("Tesseract精细化预处理效果预览")
+        preview_window.geometry("800x400")
+        preview_window.transient(self.root)
+        preview_window.grab_set()
+
+        main_frame = ttk.Frame(preview_window, padding=design.get_spacing('4'))
+        main_frame.pack(fill='both', expand=True)
+
+        image_frame = ttk.Frame(main_frame)
+        image_frame.pack(fill='both', expand=True)
+
+        original_frame = ttk.LabelFrame(image_frame, text="处理前", padding=design.get_spacing('2'))
+        original_frame.pack(side='left', fill='both', expand=True, padx=(0, design.get_spacing('2')))
+        original_label = tk.Label(original_frame, bg=design.get_color('neutral', '100'))
+        original_label.pack(fill='both', expand=True)
+
+        processed_frame = ttk.LabelFrame(image_frame, text="处理后 (送入Tesseract)", padding=design.get_spacing('2'))
+        processed_frame.pack(side='right', fill='both', expand=True, padx=(design.get_spacing('2'), 0))
+        processed_label = tk.Label(processed_frame, bg=design.get_color('neutral', '100'))
+        processed_label.pack(fill='both', expand=True)
+
+        def resize_and_display(label: tk.Label, img: Image.Image):
+            max_size = 300
+            img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            label.config(image=photo)
+            label.image = photo
+
+        resize_and_display(original_label, original_region)
+        resize_and_display(processed_label, processed_region)
+        
+        info_label = tk.Label(main_frame, text="这是对一个样本区域应用精细化预处理（缩放、增强、二值化、加边框）后的效果。\n您可以在主界面取消勾选“启用精细化预处理”来跳过此步骤。",
+                              wraplength=750, justify='center', bg=design.get_color('neutral', '50'))
+        info_label.pack(pady=(design.get_spacing('2'), 0))
+    def preview_merge_effect(self):
+        """启动一个异步任务，以预览智能行合并的效果。"""
+        if self.processing:
+            messagebox.showwarning("处理中", "当前正在进行其他操作，请稍候。")
+            return
+        if not self.current_image_path:
+            messagebox.showwarning("未选择图片", "请先选择一张图片。")
+            return
+        if not self.cvocr_manager.is_initialized or not self.cvocr_manager.text_detector:
+            messagebox.showerror("引擎未就绪", "请先初始化CVOCR引擎。")
+            return
+
+        self.set_processing(True)
+        self.log_message("🔬 正在生成智能行合并效果预览...", 'INFO')
+
+        async def preview_worker_async():
+            try:
+                # 步骤1: 预处理图像
+                self.log_message("  -> [合并预览] 步骤1: 开始预处理图像...", "DEBUG")
+                preprocess_options = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+                
+                # 使用 functools.partial 将函数和其参数打包成一个无参数的可调用对象
+                task_preprocess = functools.partial(
+                    self.image_processor.intelligent_preprocess_image,
+                    self.current_image_path,
+                    **preprocess_options
+                )
+                
+                processed_image_np, _, _ = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_preprocess
+                )
+
+                if processed_image_np is None: 
+                    raise Exception("图像预处理失败。")
+                self.log_message("  -> [合并预览] 步骤1: 预处理图像完成。", "DEBUG")
+
+                enabled_algorithms = self._get_enabled_segmentation_algorithms()
+                if not enabled_algorithms: 
+                    raise Exception("请至少选择一种高级分割技术。")
+
+                # 步骤2a: 执行分割，但不进行合并
+                self.log_message("  -> [合并预览] 步骤2a: 执行分割 (不合并)...", "DEBUG")
+                unmerged_config = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+                unmerged_config['enable_smart_line_merge'] = False
+                self.cvocr_manager.text_detector.config.update(unmerged_config)
+                
+                task_unmerged_detect = functools.partial(
+                    self.cvocr_manager.text_detector.detect_text_regions_advanced,
+                    processed_image_np,
+                    enabled_algorithms
+                )
+                unmerged_regions, _ = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_unmerged_detect
+                )
+                self.log_message(f"  -> [合并预览] 步骤2a: 分割完成，找到 {len(unmerged_regions)} 个区域。", "DEBUG")
+
+                # 步骤2b: 执行分割，并进行合并
+                self.log_message("  -> [合并预览] 步骤2b: 执行分割 (合并)...", "DEBUG")
+                merged_config = {key: var.get() for key, var in self.settings.items() if isinstance(var, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar))}
+                merged_config['enable_smart_line_merge'] = True
+                self.cvocr_manager.text_detector.config.update(merged_config)
+                
+                task_merged_detect = functools.partial(
+                    self.cvocr_manager.text_detector.detect_text_regions_advanced,
+                    processed_image_np,
+                    enabled_algorithms
+                )
+                merged_regions, _ = await self.loop.run_in_executor(
+                    self.async_ocr_processor.executor,
+                    task_merged_detect
+                )
+                self.log_message(f"  -> [合并预览] 步骤2b: 合并完成，得到 {len(merged_regions)} 个区域。", "DEBUG")
+                
+                self.log_message(f"  -> 分割结果: {len(unmerged_regions)} (合并前) -> {len(merged_regions)} (合并后)", "INFO")
+
+                # 步骤3: 绘制对比图像
+                self.log_message("  -> [合并预览] 步骤3: 正在绘制预览图像...", "DEBUG")
+                img_unmerged = processed_image_np.copy()
+                img_merged = processed_image_np.copy()
+                
+                if len(img_unmerged.shape) == 2: img_unmerged = cv2.cvtColor(img_unmerged, cv2.COLOR_GRAY2BGR)
+                if len(img_merged.shape) == 2: img_merged = cv2.cvtColor(img_merged, cv2.COLOR_GRAY2BGR)
+                
+                if unmerged_regions:
+                    cv2.polylines(img_unmerged, [np.array(r, np.int32) for r in unmerged_regions], True, (255, 0, 0), 2) # 红色：未合并
+                if merged_regions:
+                    cv2.polylines(img_merged, [np.array(r, np.int32) for r in merged_regions], True, (0, 255, 0), 2) # 绿色：已合并
+
+                img_unmerged_pil = Image.fromarray(cv2.cvtColor(img_unmerged, cv2.COLOR_BGR2RGB))
+                img_merged_pil = Image.fromarray(cv2.cvtColor(img_merged, cv2.COLOR_BGR2RGB))
+                
+                metadata = {
+                    'unmerged_count': len(unmerged_regions),
+                    'merged_count': len(merged_regions)
+                }
+                
+                # 步骤4: 在主线程显示预览窗口
+                self.log_message("  -> [合并预览] 步骤4: 即将显示预览窗口...", "DEBUG")
+                self.root.after(0, self._show_merge_preview_window, img_unmerged_pil, img_merged_pil, metadata)
+
+            except Exception as e:
+                logger.error(f"生成合并预览时发生异常: {e}", exc_info=True)
+                self.root.after(0, messagebox.showerror, "预览失败", f"生成预览失败: {e}\n\n请检查日志获取详细信息。")
+            finally:
+                self.root.after(0, self.set_processing, False)
+
+        self.loop.call_soon_threadsafe(self.loop.create_task, preview_worker_async())
+    
+    
+    
+    def _show_merge_preview_window(self, img_unmerged: Image.Image, img_merged: Image.Image, metadata: Dict):
+        """创建新窗口对比显示行合并前后的效果。"""
+        preview_window = tk.Toplevel(self.root)
+        preview_window.title("智能行合并效果预览")
+        preview_window.geometry("1600x800")
+        preview_window.transient(self.root)
+        preview_window.grab_set()
+
+        main_frame = ttk.Frame(preview_window, padding=design.get_spacing('4'))
+        main_frame.pack(fill='both', expand=True)
+
+        image_frame = ttk.Frame(main_frame)
+        image_frame.pack(fill='both', expand=True)
+
+        unmerged_frame = ttk.LabelFrame(image_frame, text=f"合并前 (红色框) - {metadata['unmerged_count']} 个区域", padding=design.get_spacing('2'))
+        unmerged_frame.pack(side='left', fill='both', expand=True, padx=(0, design.get_spacing('2')))
+        unmerged_canvas = tk.Canvas(unmerged_frame, bg='black')
+        unmerged_canvas.pack(fill='both', expand=True)
+
+        merged_frame = ttk.LabelFrame(image_frame, text=f"合并后 (绿色框) - {metadata['merged_count']} 个区域", padding=design.get_spacing('2'))
+        merged_frame.pack(side='right', fill='both', expand=True, padx=(design.get_spacing('2'), 0))
+        merged_canvas = tk.Canvas(merged_frame, bg='black')
+        merged_canvas.pack(fill='both', expand=True)
+
+        def resize_and_display(canvas: tk.Canvas, img: Image.Image):
+            canvas.update_idletasks()
+            canvas_w, canvas_h = canvas.winfo_width(), canvas.winfo_height()
+            if canvas_w <= 1 or canvas_h <= 1: return
+            
+            img_w, img_h = img.size
+            scale = min(canvas_w / img_w, canvas_h / img_h)
+            new_w, new_h = int(img_w * scale), int(img_h * scale)
+            
+            resized = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            canvas.image = photo 
+            x_offset = (canvas_w - new_w) // 2
+            y_offset = (canvas_h - new_h) // 2
+            canvas.create_image(x_offset, y_offset, image=photo, anchor='nw')
+
+        preview_window.after(100, lambda: [
+            resize_and_display(unmerged_canvas, img_unmerged),
+            resize_and_display(merged_canvas, img_merged),
+            unmerged_canvas.bind('<Configure>', lambda e: resize_and_display(unmerged_canvas, img_unmerged)),
+            merged_canvas.bind('<Configure>', lambda e: resize_and_display(merged_canvas, img_merged))
+        ])
 if __name__ == "__main__":
     app_instance = None
     try:
+        # 创建Tkinter根窗口
         root = tk.Tk()
+        # 实例化主GUI应用类
         app_instance = EnhancedCVOCRGUI(root)
         
-        # Tkinter 的 mainloop 和 asyncio 事件循环需要在不同的线程中运行
-        # 我们已经将 asyncio 放在单独线程，所以直接运行 Tkinter 的 mainloop 即可。
-        # 窗口关闭时，会通过 WM_DELETE_WINDOW 协议调用 app_instance.on_closing()
+        # 启动Tkinter的主事件循环。
+        # 此循环会一直运行，直到窗口被关闭。
+        # 窗口关闭事件由 EnhancedCVOCRGUI 内部的 protocol("WM_DELETE_WINDOW", ...) 捕获，
+        # 并调用 on_closing 方法来执行所有清理工作。
         root.mainloop()
         
     except Exception as e:
+        # 捕获应用启动或运行期间发生的任何未处理的致命错误
         logger.critical(f"应用启动或运行时发生致命错误: {e}\n{traceback.format_exc()}", exc_info=True)
-        # 尝试弹出一个简单的错误窗口，如果Tkinter还能工作的话
+        
+        # 尝试弹出一个简单的错误窗口，以便用户了解情况
         try:
-            messagebox.showerror("CVOCR应用错误", f"应用发生致命错误: {e}\n请检查日志文件 'cvocr_gui.log' 获取更多详情。")
+            # --- 额外优化：确保在创建 messagebox 之前有 root 窗口 ---
+            # 如果 root 创建失败，之前的 messagebox 会报错
+            # 这里我们创建一个临时的 root 来显示错误信息
+            root_exists = 'root' in locals() and isinstance(root, tk.Tk) and root.winfo_exists()
+            
+            if not root_exists:
+                error_root = tk.Tk()
+                error_root.withdraw() # 隐藏主窗口
+                messagebox.showerror("CVOCR应用错误", f"应用发生致命错误: {e}\n请检查日志文件 'cvocr_gui.log' 获取更多详情。", parent=error_root)
+                error_root.destroy()
+            else:
+                 messagebox.showerror("CVOCR应用错误", f"应用发生致命错误: {e}\n请检查日志文件 'cvocr_gui.log' 获取更多详情。")
         except Exception as tk_e:
-            # 如果连messagebox都无法弹出，就在控制台打印最终错误
+            # 如果连messagebox都无法弹出（例如在无头环境中），就在控制台打印最终错误
             print(f"CRITICAL ERROR (cannot show messagebox, check log file): {e}\nTraceback: {traceback.format_exc()}")
+            logger.critical(f"无法显示Tkinter错误对话框: {tk_e}", exc_info=True)
     
-    # ** 关键修正：移除了整个 finally 块 **
+    # --- 修正: 移除了整个 finally 块 ---
     # 关闭逻辑已完全由 on_closing 方法通过窗口协议触发，这里不再需要。
     # 这可以防止在应用已销毁后再次调用 on_closing 导致的 TclError。
     logger.info("Application mainloop has finished. Process is exiting.")
