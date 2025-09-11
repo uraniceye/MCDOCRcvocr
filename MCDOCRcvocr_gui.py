@@ -401,6 +401,7 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             # 发生错误时，安全地返回原始未合并的碎片，保证程序的健壮性
             return regions       
    
+    ### 废弃旧的合并逻辑，但保留函数以备他用 ###
     def _merge_text_regions_in_line(self, regions: List[np.ndarray]) -> List[np.ndarray]:
         """
         智能合并在同一行内的文本区域 (V3 - 几何优化最终版)
@@ -482,7 +483,7 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             logger.error(f"智能行合并时发生意外错误: {e}", exc_info=True)
             return regions
     
-    
+    ### 关键重构：采用全新的“聚类-聚合”工作流 ###
     def detect_text_regions_advanced(self, image: np.ndarray, 
                                  enabled_algorithms: List[str]) -> Tuple[List[np.ndarray], Dict]:
         """
@@ -609,7 +610,6 @@ class EnhancedTextDetector(AdvancedTextSegmentator):
             # 捕获整个流程中的任何异常，记录日志并安全返回
             logger.error(f"高级文本区域检测失败: {e}", exc_info=True)
             return [], {'error': str(e)}
-    
     
     def _simple_high_contrast_detection(self, gray: np.ndarray) -> List[np.ndarray]:
         """
@@ -3455,116 +3455,146 @@ class AdvancedTextImageProcessor:
     
     def adaptive_text_preprocessing(self, image: np.ndarray, quality_level: TextQualityLevel = None, **options) -> Tuple[np.ndarray, List[str]]:
         """
-        【V4.1 - 完全手动控制最终版】
-        预处理流程严格由用户通过 `options` 字典传递的开关决定。
-        废除所有基于图像质量的自动判断策略，实现完全的用户控制。
+        【V4.7 - 优化预处理顺序版】
+        - 关键修复：将几何裁剪操作（移除边框、裁剪到内容）调整到
+          破坏性的二值化操作之前执行，以确保裁剪的准确性，解决“切割不全”问题。
         """
         try:
             operations = []
-            # 从原始图像开始，根据后续步骤决定是否转换颜色空间
             processed_image = image.copy()
             
-            # --- 核心流程：严格按照用户开关顺序执行 ---
-
-            # 步骤 1: 转换为灰度图 (如果启用)
-            # 这是后续很多操作的基础
+            # --- 步骤 1: 转换为灰度图 ---
             is_gray = False
-            if options.get('enable_grayscale', False):
+            if options.get('enable_grayscale', True):
                 if len(processed_image.shape) == 3:
                     processed_image = cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
                     operations.append("转换为灰度图")
                 is_gray = True
             
-            # 步骤 2: 几何校正
+            gray_for_op = processed_image if is_gray else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+            # --- 步骤 2: 几何校正 (旋转、透视) ---
+            # 这些操作应在裁剪前完成
             if options.get('enable_deskew', False):
-                # 确保有灰度图用于倾斜检测
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                deskewed_image, angle = self._deskew_image(gray_for_op, options.get('deskew_angle_threshold', 0.5))
+                _, angle = self._deskew_image(gray_for_op, options.get('deskew_angle_threshold', 0.5))
                 if angle != 0.0:
-                    # 将旋转应用到当前正在处理的图像上（可能是彩色或灰度）
-                    center = (processed_image.shape[1] // 2, processed_image.shape[0] // 2)
+                    center = (image.shape[1] // 2, image.shape[0] // 2)
                     M = cv2.getRotationMatrix2D(center, angle, 1.0)
-                    processed_image = cv2.warpAffine(processed_image, M, (processed_image.shape[1], processed_image.shape[0]), 
-                                                     flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    # 同时旋转主处理图像和灰度副本
+                    processed_image = cv2.warpAffine(processed_image, M, (image.shape[1], image.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    gray_for_op = cv2.warpAffine(gray_for_op, M, (image.shape[1], image.shape[0]), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
                     operations.append(f"几何: 倾斜校正({angle:.2f}°)")
             
             if options.get('page_border_detection', False):
-                 # 页面检测最好在接近原始的图像上做
-                 img_for_detect = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-                 processed_after_perspective = self._detect_and_crop_page(img_for_detect)
-                 if processed_after_perspective.shape != img_for_detect.shape:
+                 processed_after_perspective = self._detect_and_crop_page(gray_for_op)
+                 if processed_after_perspective.shape != gray_for_op.shape:
                      processed_image = processed_after_perspective
-                     # 如果经过此步骤，图像肯定是灰度图了
+                     gray_for_op = processed_image
                      is_gray = True
                      operations.append("几何: 页面检测与校正")
 
-            # 步骤 3: 图像增强与清理 (这些操作通常在灰度图上效果更好)
-            if options.get('shadow_removal', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                processed_image = self._remove_shadows(gray_for_op)
-                is_gray = True
-                operations.append("增强: 阴影移除")
-            
-            if options.get('bilateral_filter', False):
-                # 双边滤波可以作用于彩色或灰度图
-                processed_image = cv2.bilateralFilter(processed_image, 
-                                                   d=options.get('bilateral_d', 9),
-                                                   sigmaColor=int(options.get('bilateral_sigma_color', 75.0)),
-                                                   sigmaSpace=int(options.get('bilateral_sigma_space', 75.0)))
-                operations.append("降噪: 双边滤波")
-            
-            if options.get('histogram_equalization', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                processed_image = cv2.equalizeHist(gray_for_op)
-                is_gray = True
-                operations.append("增强: 直方图均衡化")
-            
-            if options.get('apply_clahe', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                clahe = cv2.createCLAHE(clipLimit=options.get('clahe_clip_limit', 2.0), 
-                                      tileGridSize=options.get('clahe_tile_grid_size', (8, 8)))
-                processed_image = clahe.apply(gray_for_op)
-                is_gray = True
-                operations.append("增强: CLAHE")
-
-            if options.get('unsharp_mask', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                processed_image = self._unsharp_mask(gray_for_op, 
-                                              radius=options.get('unsharp_radius', 1.0), 
-                                              amount=options.get('unsharp_amount', 1.0))
-                is_gray = True
-                operations.append("增强: 反锐化掩模")
-
-            # 步骤 4: 二值化 (如果启用)
-            if options.get('enable_binarization', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                block_size = options.get('adaptive_block_size', 11); C_val = options.get('adaptive_c_constant', 2)
-                if block_size % 2 == 0: block_size += 1
-                processed_image = cv2.adaptiveThreshold(gray_for_op, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                                        cv2.THRESH_BINARY_INV, block_size, C_val)
-                is_gray = True # 二值化后肯定是单通道图
-                operations.append("转换: 自适应二值化")
-
-            # 步骤 5: 最终裁剪操作 (通常在二值化后效果更好)
+            # --- 步骤 3: 几何裁剪 (在像素变换前) ---
             if options.get('remove_borders', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
                 processed_image = self._remove_borders(gray_for_op, options.get('border_threshold', 10))
+                gray_for_op = processed_image # 裁剪后，灰度副本也需要更新
                 is_gray = True
                 operations.append("几何: 移除边框")
 
             if options.get('crop_to_content', False):
-                gray_for_op = processed_image if is_gray else cv2.cvtColor(processed_image, cv2.COLOR_BGR2GRAY)
-                processed_image, _ = self._crop_to_content(gray_for_op)
-                is_gray = True
-                operations.append("几何: 裁剪到内容")
+                processed_image, cropped = self._crop_to_content(gray_for_op)
+                if cropped:
+                    gray_for_op = processed_image # 裁剪后，灰度副本也需要更新
+                    is_gray = True
+                    operations.append("几何: 裁剪到内容")
 
+            # --- 步骤 4: 图像增强与清理 (在裁剪后) ---
+            # 现在，所有增强操作都在已经精确定位的图像上进行
+            if options.get('shadow_removal', False):
+                processed_image = self._remove_shadows(gray_for_op)
+                gray_for_op = processed_image
+                is_gray = True
+                operations.append("增强: 阴影移除")
+
+            normalized_gray = None
+            if options.get('background_normalization', False):
+                logger.debug("🧠 正在执行[背景归一化]增强...")
+                kernel_size = max(3, int(min(gray_for_op.shape) / 40))
+                if kernel_size % 2 == 0: kernel_size += 1
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+                background = cv2.morphologyEx(gray_for_op, cv2.MORPH_OPEN, kernel)
+                foreground = cv2.subtract(gray_for_op, background)
+                normalized_gray = cv2.bitwise_not(foreground)
+                operations.append("增强: 背景归一化")
+            
+            if options.get('bilateral_filter', False):
+                processed_image = cv2.bilateralFilter(processed_image, 
+                                                   d=options.get('bilateral_d', 9),
+                                                   sigmaColor=int(options.get('bilateral_sigma_color', 75.0)),
+                                                   sigmaSpace=int(options.get('bilateral_sigma_space', 75.0)))
+                # 如果是灰度图，更新灰度副本
+                if is_gray: gray_for_op = processed_image
+                operations.append("降噪: 双边滤波")
+            
+            if options.get('histogram_equalization', False):
+                processed_image = cv2.equalizeHist(gray_for_op)
+                gray_for_op = processed_image
+                is_gray = True
+                operations.append("增强: 直方图均衡化")
+            
+            if options.get('apply_clahe', False):
+                clahe = cv2.createCLAHE(clipLimit=options.get('clahe_clip_limit', 2.0), 
+                                      tileGridSize=options.get('clahe_tile_grid_size', (8, 8)))
+                processed_image = clahe.apply(gray_for_op)
+                gray_for_op = processed_image
+                is_gray = True
+                operations.append("增强: CLAHE")
+
+            if options.get('unsharp_mask', False):
+                processed_image = self._unsharp_mask(gray_for_op, 
+                                              radius=options.get('unsharp_radius', 1.0), 
+                                              amount=options.get('unsharp_amount', 1.0))
+                gray_for_op = processed_image
+                is_gray = True
+                operations.append("增强: 反锐化掩模")
+
+            # --- 步骤 5: 最终的二值化 (在所有增强和裁剪之后) ---
+            use_simple_binarization = options.get('binarization_simple', False)
+            use_robust_binarization = options.get('binarization_robust', False)
+
+            if use_simple_binarization:
+                logger.debug("🧠 正在执行[简单]二值化...")
+                block_size = options.get('adaptive_block_size', 11); C_val = options.get('adaptive_c_constant', 2)
+                if block_size % 2 == 0: block_size += 1
+                processed_image = cv2.adaptiveThreshold(gray_for_op, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                        cv2.THRESH_BINARY_INV, block_size, C_val)
+                is_gray = True
+                operations.append("转换: 简单自适应二值化")
+
+            elif use_robust_binarization:
+                logger.debug("🧠 正在执行[鲁棒]二值化...")
+                block_size = options.get('adaptive_block_size', 11); C_val = options.get('adaptive_c_constant', 2)
+                if block_size % 2 == 0: block_size += 1
+
+                source_for_robust = normalized_gray if normalized_gray is not None else gray_for_op
+                
+                if normalized_gray is not None:
+                    logger.debug("   -> 在归一化后的图像上进行二值化")
+                    processed_image = cv2.adaptiveThreshold(source_for_robust, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                            cv2.THRESH_BINARY, block_size, C_val)
+                else:
+                    logger.debug("   -> 背景归一化未启用，回退到Otsu二值化")
+                    _, processed_image = cv2.threshold(source_for_robust, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+                is_gray = True
+                operations.append("转换: 鲁棒二值化")
+            
             # --- 最终输出准备 ---
-            # OCR引擎通常需要3通道BGR图像，这是为了最好的兼容性
             if is_gray:
-                final_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR)
-                operations.append("输出: 转换为BGR")
+                final_image = cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR) # <--- 已修正
+                if not operations or (operations and not operations[-1].startswith("输出:")):
+                    operations.append("输出: 转换为BGR")
             else:
-                final_image = processed_image
+                final_image = processed_image if len(processed_image.shape) == 3 else cv2.cvtColor(processed_image, cv2.COLOR_GRAY2BGR) # <--- 已修正
 
             if not operations:
                 operations.append("无任何预处理操作")
@@ -3572,11 +3602,12 @@ class AdvancedTextImageProcessor:
             return final_image, operations
             
         except Exception as e:
-            logger.error(f"手动控制预处理失败: {e}\n{traceback.format_exc()}")
-            # 发生异常时，安全地返回原始图像的BGR版本
+            logger.error(f"增强预处理失败: {e}\n{traceback.format_exc()}")
             if len(image.shape) == 2:
-                return cv2.cvtColor(image, cv2.COLOR_BGR2BGR), ['错误: 预处理异常']
+                return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR), ['错误: 预处理异常']
             return image, ['错误: 预处理异常']
+    
+    
     def _optimize_image_size(self, image: np.ndarray) -> np.ndarray:
         """
         基础尺寸优化，确保图像在OCR友好的尺寸范围内（1000-1600像素的最长边）。
@@ -4063,6 +4094,9 @@ class EnhancedCVOCRManager:
         
         self.logger_func = logger_func
 
+        # 【关键修正1】: 添加一个变量来存储上一次成功初始化的配置
+        self._last_init_config = {}
+
         # 内部默认配置字典，将被UI设置覆盖
         self.config = {
             'psm': 6, 'oem': 3,
@@ -4098,6 +4132,9 @@ class EnhancedCVOCRManager:
         }
         
         logger.info("增强版CVOCR引擎管理器已创建 (等待初始化...)")
+
+    
+    
     @staticmethod
     def _execute_tesseract_subprocess(image_pil: Image.Image, tesseract_cmd_path: Optional[str], config_str: str, timeout: int) -> Dict:
         """
@@ -4288,9 +4325,9 @@ class EnhancedCVOCRManager:
     def initialize(self, language: OCRLanguage = OCRLanguage.AUTO, 
                use_gpu: bool = False, **kwargs) -> Tuple[bool, str]:
         """
-        初始化CVOCR模型 (V4.3 - 检测器逻辑修正版)。
-        - 实例化 EnhancedTextDetector 作为支持自定义算法组合的主文本检测器。
-        - PPOCRv3 模型仍然会按需加载，但主检测逻辑由 EnhancedTextDetector 驱动。
+        初始化CVOCR模型 (V4.4 - 智能重新初始化版)。
+        - 不再简单地跳过已初始化的状态，而是会比较当前请求的配置与上次成功的配置。
+        - 如果核心配置（如启用的AI模型）发生变化，将强制执行完整的重新初始化流程。
         """
         # ### 关键修正：在方法最开始就处理Tesseract路径 ###
         tesseract_path_from_config = self.config.get('tesseract_path')
@@ -4303,9 +4340,27 @@ class EnhancedCVOCRManager:
             import pytesseract
         except ImportError:
             return False, "pytesseract未安装，请先安装: pip install pytesseract"
+
+        # 【关键修正2】: 引入智能重新初始化逻辑
+        # 定义哪些配置项的改变需要强制重新初始化
+        critical_config_keys = [
+            'enable_layout_analysis', 'enable_context_analysis', 
+            'enable_transformer_ocr', 'use_gpu', 'language'
+        ]
         
+        # 从当前配置中提取关键项
+        current_critical_config = {key: self.config.get(key) for key in critical_config_keys}
+        
+        # 检查是否需要重新初始化
+        # 条件：已经初始化过 AND 关键配置发生了变化
+        if self.is_initialized and current_critical_config != self._last_init_config:
+            self.logger_func("ℹ️ 检测到AI组件或核心配置已更改，将执行重新初始化...", "INFO")
+            # 重置状态，允许后续代码执行
+            self.is_initialized = False 
+        
+        # 保留原来的“无需重复”检查，但现在它只在配置完全相同时生效
         if self.is_initialized:
-            logger.info("CVOCR引擎已初始化，无需重复。")
+            logger.info("CVOCR引擎已初始化，且配置未变，无需重复。")
             return True, "CVOCR引擎已初始化"
 
         # --- 核心逻辑修正：实例化 EnhancedTextDetector 作为主检测器 ---
@@ -4414,6 +4469,9 @@ class EnhancedCVOCRManager:
         init_time = time.time() - start_init_time
         self.is_initialized = True
 
+        # 【关键修正3】: 初始化成功后，保存当前的配置
+        self._last_init_config = current_critical_config.copy()
+
         self.version_info = {
             'cvocr_version': CVOCRConstants.VERSION,
             'python': sys.version.split()[0],
@@ -4445,7 +4503,6 @@ class EnhancedCVOCRManager:
         success_message = f"CVOCR引擎初始化成功：语言: {language.value}, 精度: custom, 耗时: {init_time:.2f}秒"
         logger.info(f"{success_message}, AI设备: {self.device}")
         return True, success_message
-    
     
     
     
@@ -5507,7 +5564,6 @@ class EnhancedCVOCRManager:
                 }
             }
     
-    
     def _match_text_to_layout(self, text_block: Dict, layout_info: Dict) -> Dict:
         """将文本块匹配到布局信息"""
         try:
@@ -6200,9 +6256,9 @@ class EnhancedCVOCRGUI:
     
     def __init__(self, master: Optional[tk.Tk] = None):
         """
-        增强版CVOCR GUI主界面的构造函数 (V4.8 - 最终配置与状态版)。
+        增强版CVOCR GUI主界面的构造函数 (V4.9 - 独立背景归一化版)。
         负责初始化窗口、所有后端管理器、GUI状态变量，并定义了所有与UI控件绑定的Tkinter变量。
-        这是整个应用程序所有用户可配置状态的“单一事实来源”。
+        - 关键修改：新增 'background_normalization' 状态变量。
         """
         # ======================================================================
         # 1. 窗口和基础设置
@@ -6255,7 +6311,6 @@ class EnhancedCVOCRGUI:
         # ======================================================================
         self.settings = {
             # --- OCR与检测核心配置 ---
-            
             'language': tk.StringVar(value='auto'),
             'tesseract_path': tk.StringVar(value=''),
             'confidence_threshold': tk.DoubleVar(value=CVOCRConstants.DEFAULT_CONFIDENCE_THRESHOLD),
@@ -6295,7 +6350,8 @@ class EnhancedCVOCRGUI:
             
             # --- 核心转换步骤 ---
             'enable_grayscale': tk.BooleanVar(value=True),
-            'enable_binarization': tk.BooleanVar(value=True),
+            # 注意：二值化相关的 'binarization_simple' 和 'binarization_robust'
+            # 将在 _create_advanced_settings_section 中按需创建，不在此处全局定义。
             'adaptive_block_size': tk.IntVar(value=11), 
             'adaptive_c_constant': tk.IntVar(value=2), 
             
@@ -6309,6 +6365,7 @@ class EnhancedCVOCRGUI:
             
             # --- 图像增强与降噪 ---
             'shadow_removal': tk.BooleanVar(value=True),
+            'background_normalization': tk.BooleanVar(value=True), # <-- 【最终修正】新增的选项
             'bilateral_filter': tk.BooleanVar(value=True), 
             'bilateral_d': tk.IntVar(value=9),
             'bilateral_sigma_color': tk.DoubleVar(value=75.0),
@@ -6362,6 +6419,8 @@ class EnhancedCVOCRGUI:
             self.add_debug_monitoring()
         except Exception as e:
             logger.warning(f"启动调试监控失败: {e}")
+    
+    
     def _start_async_loop_in_thread(self):
         """在一个单独的线程中启动 asyncio 事件循环"""
         def run_loop():
@@ -6643,6 +6702,7 @@ class EnhancedCVOCRGUI:
             'microsoft/layoutlmv2-base-uncased',
             'microsoft/layoutlmv2-large-uncased' # 提供大模型选项
         ]
+        # 【关键修正1】: 将状态标签的引用保存到 self.layoutlm_status_label
         self.layoutlm_status_label = create_component_widget(
             components_frame,
             check_var_name='enable_layout_analysis',
@@ -6661,6 +6721,7 @@ class EnhancedCVOCRGUI:
             'EleutherAI/gpt-neo-125M',
             'EleutherAI/gpt-neo-1.3B' # 提供更大、更强的模型选项
         ]
+        # 【关键修正2】: 将状态标签的引用保存到 self.gpt_neo_status_label
         self.gpt_neo_status_label = create_component_widget(
             components_frame,
             check_var_name='enable_context_analysis',
@@ -6682,6 +6743,7 @@ class EnhancedCVOCRGUI:
             'microsoft/trocr-large-printed', # 提供大模型选项
             'google/trocr-base-zh-printed'
         ]
+        # 【关键修正3】: 将状态标签的引用保存到 self.trocr_status_label (与原代码保持一致，但确保引用存在)
         self.trocr_status_label = create_component_widget(
             components_frame,
             check_var_name='enable_transformer_ocr',
@@ -6691,6 +6753,10 @@ class EnhancedCVOCRGUI:
             model_list=trocr_models,
             tooltip_text="直接从图像像素识别文本，适合无复杂布局的清晰图像。开启此项时，高级分割将被忽略。"
         )
+
+    
+    
+    
     def _browse_for_yolo_file(self, setting_var: tk.StringVar, title: str, filetypes: List[Tuple[str, str]]):
         """打开文件对话框以选择YOLO模型文件。"""
         file_path = filedialog.askopenfilename(title=title, filetypes=filetypes)
@@ -7015,11 +7081,9 @@ class EnhancedCVOCRGUI:
     
     def _create_advanced_settings_section(self):
         """
-        创建高级设置区（V4.1 - 完全手动控制 & 预设管理版）。
-        - 为所有预处理操作添加独立的启用/禁用复选框。
-        - 移除所有后台自动策略，流程完全由用户勾选决定。
-        - 新增预设保存与加载功能。
-        - 新增对核心转换步骤（灰度、二值化）的控制。
+        创建高级设置区（V4.6 - 独立背景归一化UI版）。
+        - 在“图像增强”部分添加了“背景归一化”的独立复选框。
+        - 保持了二值化选项的互斥复选框UI和逻辑。
         """
         advanced_frame = ttk.LabelFrame(self.inner_control_frame, text="高级设置", padding=design.get_spacing('3'))
         advanced_frame.pack(fill='x', pady=(0, design.get_spacing('4')))
@@ -7045,7 +7109,7 @@ class EnhancedCVOCRGUI:
         
         ttk.Separator(preprocessing_frame, orient='horizontal').pack(fill='x', pady=design.get_spacing('2'))
 
-        # --- 几何校正组 (现在每个都有自己的开关) ---
+        # --- 几何校正组 ---
         geo_frame = ttk.LabelFrame(preprocessing_frame, text="几何校正", padding=design.get_spacing('2'))
         geo_frame.pack(fill='x', pady=design.get_spacing('1'))
         
@@ -7064,11 +7128,20 @@ class EnhancedCVOCRGUI:
         ttk.Checkbutton(geo_frame, text="✂️ 裁剪到内容", variable=self.settings['crop_to_content'], style='TCheckbutton').pack(anchor='w')
         ttk.Checkbutton(geo_frame, text="📄 页面边框检测", variable=self.settings['page_border_detection'], style='TCheckbutton').pack(anchor='w')
 
-        # --- 图像增强与降噪组 (现在每个都有自己的开关) ---
+        # --- 图像增强与降噪组 ---
         enhance_frame = ttk.LabelFrame(preprocessing_frame, text="图像增强与降噪", padding=design.get_spacing('2'))
         enhance_frame.pack(fill='x', pady=design.get_spacing('1'))
 
         ttk.Checkbutton(enhance_frame, text="🌫️ 阴影移除", variable=self.settings['shadow_removal'], style='TCheckbutton').pack(anchor='w')
+        
+        ### 【关键新增】添加背景归一化复选框 ###
+        bg_norm_check = ttk.Checkbutton(enhance_frame, text="💡 背景归一化 (处理反色/光照不均)", 
+                                        variable=self.settings['background_normalization'], style='TCheckbutton')
+        bg_norm_check.pack(anchor='w')
+        Tooltip(bg_norm_check, 
+                "核心功能！通过估算并移除平滑的背景，\n"
+                "统一图像的对比度模式（都变为深色文本、浅色背景）。\n"
+                "强烈建议在处理包含深色背景、阴影或光照不均的图像时启用。")
         
         bilateral_row = ttk.Frame(enhance_frame)
         bilateral_row.pack(fill='x', pady=(0, design.get_spacing('1')))
@@ -7097,17 +7170,65 @@ class EnhancedCVOCRGUI:
         core_conversion_frame.pack(fill='x', pady=design.get_spacing('1'))
 
         ttk.Checkbutton(core_conversion_frame, text="⚙️ 转换为灰度图", 
-                        variable=self.settings['enable_grayscale'], style='TCheckbutton').pack(anchor='w')
+                        variable=self.settings['enable_grayscale'], style='TCheckbutton').pack(anchor='w', pady=(0, design.get_spacing('1')))
         
-        binarization_row = ttk.Frame(core_conversion_frame)
-        binarization_row.pack(fill='x', pady=(0, design.get_spacing('1')))
-        ttk.Checkbutton(binarization_row, text="⚫⚪ 二值化", 
-                        variable=self.settings['enable_binarization'], style='TCheckbutton').pack(side='left')
+        # --- 使用两个互斥的复选框来实现模式选择 ---
+        if 'binarization_simple' not in self.settings:
+             self.settings['binarization_simple'] = tk.BooleanVar(value=False)
+        if 'binarization_robust' not in self.settings:
+             self.settings['binarization_robust'] = tk.BooleanVar(value=True)
 
-        ttk.Label(binarization_row, text="块大小:").pack(side='left', padx=(design.get_spacing('4'), design.get_spacing('1')))
-        ttk.Scale(binarization_row, from_=3, to=35, variable=self.settings['adaptive_block_size'], orient='horizontal', length=80).pack(side='left')
-        ttk.Label(binarization_row, text="C值:").pack(side='left', padx=(design.get_spacing('2'), design.get_spacing('1')))
-        ttk.Scale(binarization_row, from_=0, to=15, variable=self.settings['adaptive_c_constant'], orient='horizontal', length=80).pack(side='left')
+        binarization_options_row = ttk.Frame(core_conversion_frame)
+        binarization_options_row.pack(fill='x', pady=(design.get_spacing('1'), 0))
+        
+        check_simple = ttk.Checkbutton(binarization_options_row, text="⚫⚪ 二值化 (简单模式)", 
+                                       variable=self.settings['binarization_simple'], style='TCheckbutton')
+        check_simple.pack(side='left')
+        Tooltip(check_simple, "传统自适应阈值，速度快，适合背景清晰的文档。")
+        
+        check_robust = ttk.Checkbutton(binarization_options_row, text="⚫⚪ 二值化 (鲁棒模式)", 
+                                       variable=self.settings['binarization_robust'], style='TCheckbutton')
+        check_robust.pack(side='left', padx=(design.get_spacing('4'), 0))
+        Tooltip(check_robust, "根据是否启用'背景归一化'采取不同策略，推荐！")
+
+        params_frame = ttk.Frame(core_conversion_frame)
+        params_frame.pack(fill='x', padx=(20, 0), pady=(design.get_spacing('1'), 0))
+
+        params_frame.columnconfigure(1, weight=1)
+        params_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(params_frame, text="块大小:").grid(row=0, column=0, sticky='w')
+        ttk.Scale(params_frame, from_=3, to=35, variable=self.settings['adaptive_block_size'], orient='horizontal').grid(row=0, column=1, sticky='we', padx=(design.get_spacing('1'), design.get_spacing('2')))
+        
+        ttk.Label(params_frame, text="C值:").grid(row=0, column=2, sticky='w')
+        ttk.Scale(params_frame, from_=0, to=15, variable=self.settings['adaptive_c_constant'], orient='horizontal').grid(row=0, column=3, sticky='we', padx=(design.get_spacing('1'), 0))
+        
+        self._simple_cb_id = None
+        self._robust_cb_id = None
+
+        def _update_binarization_controls(*args):
+            if self._simple_cb_id:
+                self.settings['binarization_simple'].trace_remove('write', self._simple_cb_id)
+            if self._robust_cb_id:
+                self.settings['binarization_robust'].trace_remove('write', self._robust_cb_id)
+            
+            var_name = args[0]
+            if var_name == str(self.settings['binarization_simple']) and self.settings['binarization_simple'].get():
+                self.settings['binarization_robust'].set(False)
+            elif var_name == str(self.settings['binarization_robust']) and self.settings['binarization_robust'].get():
+                self.settings['binarization_simple'].set(False)
+
+            is_any_checked = self.settings['binarization_simple'].get() or self.settings['binarization_robust'].get()
+            new_state = 'normal' if is_any_checked else 'disabled'
+            for child in params_frame.winfo_children():
+                child.config(state=new_state)
+
+            self._simple_cb_id = self.settings['binarization_simple'].trace_add('write', _update_binarization_controls)
+            self._robust_cb_id = self.settings['binarization_robust'].trace_add('write', _update_binarization_controls)
+
+        self._simple_cb_id = self.settings['binarization_simple'].trace_add('write', _update_binarization_controls)
+        self._robust_cb_id = self.settings['binarization_robust'].trace_add('write', _update_binarization_controls)
+        _update_binarization_controls(str(self.settings['binarization_robust']))
 
         # --- 显示与保存设置 ---
         display_frame = ttk.LabelFrame(advanced_frame, text="显示与保存设置", padding=design.get_spacing('2'))
@@ -7843,51 +7964,58 @@ class EnhancedCVOCRGUI:
     
     def _handle_init_result(self, success: bool, message: str):
         """
-        处理初始化结果，并更新GUI的各个相关部分。
+        处理初始化结果，并全面更新GUI的各个相关部分。(V2.0 - 全状态更新版)
         - 更新系统状态区的标签和颜色。
         - 记录详细的初始化日志。
-        - 更新新增的TransformerOCR模型加载状态标签。
+        - 【核心修复】全面更新所有AI组件（LayoutLMv2, GPT-Neo, TrOCR）的加载状态标签。
         - 弹出对话框通知用户初始化结果。
         """
         if success:
             self.status_label.config(text="CVOCR引擎就绪", style='Success.TLabel')
             self.log_message(f"✅ {message}", 'SUCCESS')
             
-            # 显示详细的版本和配置信息
             version_info = self.cvocr_manager.version_info
             self.log_message(f"📊 初始化耗时: {version_info.get('init_time', 0):.2f}秒", 'INFO')
             self.log_message(f"🔧 Tesseract版本: {version_info.get('tesseract', 'unknown')}", 'INFO')
-            self.log_message(f"🌐 识别语言: {version_info.get('language', 'unknown')}", 'INFO')
             
-            # 显示已启用的AI组件状态
             components = version_info.get('components', {})
-            if components:
-                enabled_components = [comp.replace('_enabled', '').upper() for comp, enabled in components.items() if enabled]
-                if enabled_components:
-                    self.log_message(f"🎯 已启用组件: {', '.join(enabled_components)}", 'INFO')
+            enabled_components = [comp.replace('_enabled', '').upper() for comp, enabled in components.items() if enabled]
+            if enabled_components:
+                self.log_message(f"🎯 已启用组件: {', '.join(enabled_components)}", 'INFO')
             
-            # --- 新增：更新TrOCR模型加载状态标签 ---
-            # 根据初始化结果中的组件状态来设置标签的文本和颜色。
-            if components.get('transformer_ocr_enabled'):
-                self.trocr_model_status_label.config(text="✅ 已加载", foreground="green")
-            elif self.settings['enable_transformer_ocr'].get():
-                # 如果用户勾选了启用，但初始化后组件状态仍为未启用，则说明加载失败
-                self.trocr_model_status_label.config(text="❌ 加载失败", foreground="red")
-            else:
-                # 如果用户未勾选启用，则显示为未启用状态
-                self.trocr_model_status_label.config(text=" (未启用)", foreground="gray")
-
             messagebox.showinfo("初始化成功", f"{message}\n\nCVOCR引擎已就绪，可以开始文本识别！")
         else:
             self.status_label.config(text="初始化失败", style='Error.TLabel')
             self.log_message(f"❌ {message}", 'ERROR')
-            
-            # --- 新增：在初始化失败时，同样更新TrOCR模型状态标签 ---
-            # 如果初始化失败，所有AI模型都应被视为未加载
-            self.trocr_model_status_label.config(text="❌ 未加载", foreground="red")
-            
+            components = {} # 初始化失败时，所有组件都视为未加载
             messagebox.showerror("初始化失败", f"{message}\n\n建议先运行系统检查。")
 
+        # --- 【核心修复】无论成功或失败，都根据最终的组件状态全面更新UI ---
+        
+        # 定义一个辅助函数来更新状态标签
+        def update_status_label(label, enabled_by_user, loaded_successfully):
+            if enabled_by_user:
+                if loaded_successfully:
+                    label.config(text="✅ 已加载", foreground="green")
+                else:
+                    label.config(text="❌ 加载失败", foreground="red")
+            else:
+                label.config(text="(未启用)", foreground="gray")
+
+        # 更新LayoutLMv2状态
+        update_status_label(self.layoutlm_status_label,
+                            self.settings['enable_layout_analysis'].get(),
+                            components.get('layoutlm_enabled', False))
+        
+        # 更新GPT-Neo状态
+        update_status_label(self.gpt_neo_status_label,
+                            self.settings['enable_context_analysis'].get(),
+                            components.get('gpt_neo_enabled', False))
+
+        # 更新Transformer OCR状态
+        update_status_label(self.trocr_status_label,
+                            self.settings['enable_transformer_ocr'].get(),
+                            components.get('transformer_ocr_enabled', False))
     async def _trigger_initial_system_check_async(self):
         """异步触发初始系统检查"""
         await self.check_system_async()
@@ -8465,10 +8593,10 @@ class EnhancedCVOCRGUI:
         return enabled_algos
     def start_enhanced_recognition(self):
         """
-        开始增强文本识别 (V4.2 - GUI参数完全同步最终版)。
+        开始增强文本识别 (V4.3 - 互斥复选框版)。
         此方法作为用户点击“开始识别”按钮的入口，负责：
         1. 执行所有前置检查（如处理状态、引擎初始化、图片选择）。
-        2. 全面收集GUI界面上所有相关的设置，包括所有预处理开关和高级分割技术选项。
+        2. 全面收集GUI界面上所有相关的设置，包括新的互斥二值化选项。
         3. 将这些设置更新到后端的 CVOCRManager 实例中。
         4. 创建并调度一个异步的识别任务，以避免阻塞GUI。
         """
@@ -8536,7 +8664,10 @@ class EnhancedCVOCRGUI:
             'adaptive_block_size': self.settings['adaptive_block_size'].get(),
             'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
             'enable_grayscale': self.settings['enable_grayscale'].get(),
-            'enable_binarization': self.settings['enable_binarization'].get(),
+            
+            ### 【关键修正】传递新的互斥二值化复选框的值 ###
+            'binarization_simple': self.settings['binarization_simple'].get(),
+            'binarization_robust': self.settings['binarization_robust'].get(),
             
             # AI组件开关
             'enable_layout_analysis': self.settings['enable_layout_analysis'].get(),
@@ -8595,11 +8726,12 @@ class EnhancedCVOCRGUI:
             language
         ))
     
-    
     def preview_preprocessing(self):
         """
         预览当前图像应用所有预处理设置后的效果。
-        此版本修复了因引用已移除的 'enable_advanced_preprocessing' 设置而导致的 KeyError。
+        (V4.4 - 修复 KeyError 版): 
+        - 更新配置收集逻辑，使用新的 'binarization_simple' 和 'binarization_robust'
+          键，以匹配UI和状态管理器的变化。
         """
         if self.processing:
             messagebox.showwarning("处理中", "当前正在进行其他操作，请稍候。")
@@ -8612,22 +8744,22 @@ class EnhancedCVOCRGUI:
         self.set_processing(True)
         self.log_message(f"🔬 正在生成预处理预览: {os.path.basename(self.current_image_path)}", 'INFO')
 
+        # --- 【核心修正】更新配置收集逻辑 ---
         # 收集所有相关的预处理设置
-        # --- 核心修正：移除了对不存在的 'enable_advanced_preprocessing' 的引用 ---
         preprocess_options = {
             'enable_preprocessing': True, # 预览时强制启用
             'enable_advanced_segmentation': False, # 模拟纯文本识别流程以展示所有效果
-            # 'force_intensive_preprocessing' 键已移除
+            
+            # 几何校正
             'enable_deskew': self.settings['enable_deskew'].get(),
             'deskew_angle_threshold': self.settings['deskew_angle_threshold'].get(),
             'remove_borders': self.settings['remove_borders'].get(),
             'border_threshold': self.settings['border_threshold'].get(),
             'crop_to_content': self.settings['crop_to_content'].get(),
             'page_border_detection': self.settings['page_border_detection'].get(),
+            
+            # 图像增强与降噪
             'shadow_removal': self.settings['shadow_removal'].get(),
-            # 'denoise_strength' 和 'edge_preservation' 在当前 image_processor 中未直接使用，但保留以备将来扩展
-            # 'denoise_strength': self.settings['denoise_strength'].get(),
-            # 'edge_preservation': self.settings['edge_preservation'].get(),
             'unsharp_mask': self.settings['unsharp_mask'].get(),
             'unsharp_radius': self.settings['unsharp_radius'].get(),
             'unsharp_amount': self.settings['unsharp_amount'].get(),
@@ -8639,11 +8771,17 @@ class EnhancedCVOCRGUI:
             'apply_clahe': self.settings['apply_clahe'].get(),
             'clahe_clip_limit': self.settings['clahe_clip_limit'].get(),
             'clahe_tile_grid_size': (self.settings['clahe_tile_grid_size_x'].get(), self.settings['clahe_tile_grid_size_y'].get()),
+            
+            # 核心转换步骤
+            'enable_grayscale': self.settings['enable_grayscale'].get(),
             'adaptive_block_size': self.settings['adaptive_block_size'].get(),
             'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
-            'enable_grayscale': self.settings['enable_grayscale'].get(),
-            'enable_binarization': self.settings['enable_binarization'].get(),
+
+            ### 将 'enable_binarization' 替换为两个新的布尔值 ###
+            'binarization_simple': self.settings['binarization_simple'].get(),
+            'binarization_robust': self.settings['binarization_robust'].get(),
         }
+        # --- 修正结束 ---
 
         async def preview_worker_async():
             try:
@@ -8677,8 +8815,6 @@ class EnhancedCVOCRGUI:
         
         # 将异步任务提交到事件循环中
         self.loop.call_soon_threadsafe(self.loop.create_task, preview_worker_async())
-    
-    
     
     
     def preview_segmentation(self):
@@ -9191,10 +9327,9 @@ class EnhancedCVOCRGUI:
 
     def quick_ocr(self):
         """
-        快速OCR，直接识别当前图片 (V2.1 - 尊重用户UI选择版)。
-        - 不再硬编码预处理步骤，而是动态读取用户在“高级设置”中的勾选状态。
-        - 允许用户完全控制“快速模式”下的预处理流程，提供了最大的灵活性。
-        - UI注释会引导用户启用核心预处理选项以获得最佳效果。
+        快速OCR，直接识别当前图片 (V2.3 - 修复配置断链版)。
+        - 关键修复：不再使用硬编码的配置，而是动态地从UI的 self.settings 中
+          读取所有用户选择的预处理选项，确保用户的选择（如鲁棒二值化）能够生效。
         """
         if self.processing:
             messagebox.showwarning("处理中", "当前正在进行识别，请稍候。")
@@ -9216,20 +9351,24 @@ class EnhancedCVOCRGUI:
         language_str = self.settings['language'].get()
         language = OCRLanguage(language_str) if language_str != 'auto' else OCRLanguage.AUTO
         
-        # --- 核心逻辑：构建配置时，动态读取所有相关的UI设置 ---
+        # --- 【核心修正】动态地从 self.settings 收集所有UI设置 ---
         quick_config = {
             'language': language.value,
-            'psm': 3,
-            'oem_options': {'0': False, '1': False, '2': False, '3': True},
-            'confidence_threshold': 0,
+            'psm': self.settings['psm_mode'].get(), # 读取用户选择的PSM
+            'oem_options': {k: v.get() for k, v in self.settings['oem_options'].items()}, # 读取用户选择的OEM
+            'confidence_threshold': self.settings['confidence_threshold'].get(),
             'use_gpu': self.settings['use_gpu'].get(),
             'quick_mode': True,
 
-            # --- 关键：动态获取用户在UI上选择的所有预处理选项 ---
+            # 动态获取用户在UI上选择的所有预处理选项
             'enable_preprocessing': self.settings['enable_preprocessing'].get(),
             'enable_preprocessing_optimization': self.settings['enable_preprocessing'].get(),
             'enable_grayscale': self.settings['enable_grayscale'].get(),
-            'enable_binarization': self.settings['enable_binarization'].get(),
+            
+            # 传递新的互斥复选框的值
+            'binarization_simple': self.settings['binarization_simple'].get(),
+            'binarization_robust': self.settings['binarization_robust'].get(),
+            
             'adaptive_block_size': self.settings['adaptive_block_size'].get(),
             'adaptive_c_constant': self.settings['adaptive_c_constant'].get(),
             'enable_deskew': self.settings['enable_deskew'].get(),
@@ -9237,12 +9376,13 @@ class EnhancedCVOCRGUI:
             'crop_to_content': self.settings['crop_to_content'].get(),
             'page_border_detection': self.settings['page_border_detection'].get(),
             'shadow_removal': self.settings['shadow_removal'].get(),
+            'background_normalization': self.settings['background_normalization'].get(),
             'bilateral_filter': self.settings['bilateral_filter'].get(),
             'histogram_equalization': self.settings['histogram_equalization'].get(),
             'apply_clahe': self.settings['apply_clahe'].get(),
             'unsharp_mask': self.settings['unsharp_mask'].get(),
 
-            # --- 显式禁用与“快速模式”冲突的高级功能 ---
+            # 显式禁用与“快速模式”冲突的高级功能
             'enable_advanced_segmentation': False,
             'enable_layout_analysis': False,
             'enable_context_analysis': False,
@@ -9255,8 +9395,12 @@ class EnhancedCVOCRGUI:
         used_preprocess_steps = []
         if quick_config['enable_preprocessing']:
             core_steps = {
-                '灰度化': 'enable_grayscale', '二值化': 'enable_binarization',
-                '倾斜校正': 'enable_deskew', '阴影移除': 'shadow_removal'
+                '灰度化': 'enable_grayscale',
+                '背景归一化': 'background_normalization',
+                '二值化(简单)': 'binarization_simple',
+                '二值化(鲁棒)': 'binarization_robust',
+                '倾斜校正': 'enable_deskew',
+                '阴影移除': 'shadow_removal'
             }
             for name, key in core_steps.items():
                 if quick_config.get(key):
@@ -9273,7 +9417,7 @@ class EnhancedCVOCRGUI:
         
         async def quick_ocr_worker_async(image_path_to_process, lang):
             try:
-                # 重新初始化Tesseract配置
+                # 重新初始化Tesseract配置以应用用户选择的PSM等设置
                 init_tess_success, init_tess_msg = await self.loop.run_in_executor(
                     self.async_ocr_processor.executor,
                     self.cvocr_manager._initialize_tesseract
@@ -9281,7 +9425,6 @@ class EnhancedCVOCRGUI:
                 if not init_tess_success:
                     raise Exception(f"Tesseract引擎配置更新失败: {init_tess_msg}")
 
-                # 根据配置总开关决定是否启用预处理
                 enable_preproc = self.cvocr_manager.config.get('enable_preprocessing', False)
                 
                 results, message = await self.async_ocr_processor.run_blocking_ocr_task(
@@ -9299,6 +9442,9 @@ class EnhancedCVOCRGUI:
                 self.root.after(0, self._update_performance_display)
 
         self.loop.call_soon_threadsafe(self.loop.create_task, quick_ocr_worker_async(self.current_image_path, language))
+    
+    
+    
     def show_visualization(self):
         """显示当前识别结果的边界框可视化"""
         if not self.result_manager.current_results:
